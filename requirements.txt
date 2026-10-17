@@ -1,0 +1,7 @@
+# Optional EML authentication verification. The analyzer continues with unknown/unavailable results if absent.
+dkimpy
+dnspython
+publicsuffix2
+pyspf==2.0.14
+# Optional static Office macro detection; unavailable/error is reported as unknown.
+oletools
