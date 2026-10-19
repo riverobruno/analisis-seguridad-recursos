@@ -521,8 +521,9 @@ def _meaningful_report_value(value):
                 meaningful[key] = item
         return meaningful or None
     if isinstance(value, (list, tuple, set)):
+        values = sorted(value, key=lambda item: _compact_report_value(item)) if isinstance(value, set) else value
         meaningful = []
-        for item in value:
+        for item in values:
             item = _meaningful_report_value(item)
             if item is not None:
                 meaningful.append(item)
@@ -532,11 +533,85 @@ def _meaningful_report_value(value):
     return value
 
 
+def _report_value_is_container(value):
+    return isinstance(value, (dict, list, tuple, set))
+
+
+def _print_report_value(value, indent=2):
+    """Print report values as bounded, deterministic, YAML-like evidence."""
+    prefix = " " * indent
+    if isinstance(value, dict):
+        for key, item in sorted(value.items(), key=lambda pair: str(pair[0])):
+            item = _meaningful_report_value(item)
+            if item is None:
+                continue
+            key_text = _compact_report_value(key, limit=120)
+            if _report_value_is_container(item):
+                print(f"{prefix}{key_text}:")
+                _print_report_value(item, indent + 2)
+            else:
+                print(f"{prefix}{key_text}: {_compact_report_value(item)}")
+        return
+    if isinstance(value, (list, tuple, set)):
+        values = sorted(value, key=lambda item: _compact_report_value(item)) if isinstance(value, set) else value
+        for item in values:
+            item = _meaningful_report_value(item)
+            if item is None:
+                continue
+            if _report_value_is_container(item):
+                print(f"{prefix}-")
+                _print_report_value(item, indent + 2)
+            else:
+                print(f"{prefix}- {_compact_report_value(item)}")
+        return
+    print(f"{prefix}{_compact_report_value(value)}")
+
+
 def _print_report_section(label, value):
     value = _meaningful_report_value(value)
     if value is None:
         return
-    print(f"{label}: {_compact_report_value(value)}")
+    print(f"{label}:")
+    _print_report_value(value)
+
+
+def _criteria_sort_key(item):
+    preferred = ("authentication", "domain", "detections", "behavior")
+    key = str(item[0])
+    return (0, preferred.index(key)) if key in preferred else (1, key)
+
+
+def _print_criteria_section(criteria):
+    if not isinstance(criteria, dict):
+        return
+    entries = []
+    for key, value in criteria.items():
+        value = _meaningful_report_value(value)
+        if value is not None:
+            entries.append((key, value))
+    if not entries:
+        return
+
+    print("CRITERIOS:")
+    for key, value in sorted(entries, key=_criteria_sort_key):
+        key_text = _compact_report_value(key, limit=120)
+        if isinstance(value, dict):
+            status = value.get("status", "unknown")
+            details = dict(value)
+            details.pop("status", None)
+            if _report_value_is_container(status):
+                print(f"  {key_text}:")
+                _print_report_value(value, 4)
+            else:
+                print(f"  {key_text}: {_compact_report_value(status)}")
+                details = _meaningful_report_value(details)
+                if details is not None:
+                    _print_report_value(details, 4)
+        elif _report_value_is_container(value):
+            print(f"  {key_text}:")
+            _print_report_value(value, 4)
+        else:
+            print(f"  {key_text}: {_compact_report_value(value)}")
 
 
 def imprimir_veredicto(evidencia):
@@ -566,10 +641,7 @@ def imprimir_veredicto(evidencia):
         if key in applicable:
             _print_report_section(label, report.get(key))
     criteria = evidencia.get("criteria", {}) if isinstance(evidencia, dict) else {}
-    if criteria:
-        statuses = "; ".join(f"{key}={value.get('status', 'unknown')}"
-                             for key, value in criteria.items() if isinstance(value, dict))
-        _print_report_section("CRITERIOS", statuses)
+    _print_criteria_section(criteria)
     issues = []
     for item in evidencia.get("service_issues", []) if isinstance(evidencia, dict) else []:
         if isinstance(item, dict) and item.get("service") and item.get("reason"):

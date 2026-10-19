@@ -1,108 +1,79 @@
 # Análisis de correos, URLs y archivos
 
-Script de Python para analizar un correo `.eml`, una URL o un archivo local y generar un reporte con evidencias y veredicto: **Legítimo**, **Legítimo aparente — análisis estático** (solo EML), **No concluyente**, **Sospechoso** o **Infectado**.
+El script analiza un correo `.eml`, una URL HTTP(S) o un archivo local y muestra evidencias junto con uno de tres veredictos. La legitimidad nunca puede garantizarse: el resultado solo resume la evidencia disponible y el alcance de las comprobaciones realizadas.
 
-> **Seguridad:** los archivos se analizan estáticamente; no se ejecutan ni se suben. Las URLs no se abren desde tu computadora. Si configurás `URLSCAN_API_KEY`, urlscan.io recibe la URL y la visita de forma remota.
+## Análisis por tipo de recurso
 
-## Instalación
+### Correo `.eml`
 
-Necesitás Python 3 y conexión a Internet para consultar servicios externos. Ejecutá los comandos desde la carpeta del proyecto.
+- Evalúa SPF, DKIM y DMARC, incluyendo los resultados `pass` de `Authentication-Results` como evidencia válida.
+- Conserva la verificación criptográfica de DKIM como comprobación adicional y separada.
+- Compara los dominios de `From`, `Reply-To` y `Return-Path`, y muestra la IP de origen candidata de `Received`.
+- Analiza el dominio de `From` mediante VirusTotal; no consulta WHOIS ni crt.sh para ese dominio por sí solo.
+- Extrae URLs y las analiza con el flujo URL. Inventaría adjuntos y los analiza como archivos, sin ejecutar ni subir contenido.
 
-**Windows (PowerShell):**
-```powershell
-py -3 -m venv .venv
-& ./.venv/Scripts/Activate.ps1
-python -m pip install -r requirements.txt
-```
+### URL
 
-**macOS / Linux:**
+- Consulta reputación, detecciones y relaciones disponibles en VirusTotal.
+- Puede consultar urlscan.io de forma privada si existe `URLSCAN_API_KEY`; el sitio se visita desde urlscan, no desde tu computadora.
+- Consulta WHOIS y crt.sh para edad, registrador, servidores de nombres y certificados del dominio.
+
+### Archivo local o adjunto
+
+- Calcula el SHA-256 y consulta únicamente ese hash en VirusTotal; nunca sube el archivo.
+- Informa tamaño, tipo detectado y metadatos disponibles.
+- Inspecciona estáticamente macros y scripts embebidos cuando corresponde. Nunca ejecuta archivos, scripts ni macros.
+
+## Ejecución
+
+Necesitás Python 3 y las dependencias del proyecto:
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
 
-### Claves de servicios (opcional)
+En Windows PowerShell, activá el entorno con `./.venv/Scripts/Activate.ps1`.
 
-No necesitás crear un archivo `.env` para ejecutar el script. Sin claves, las consultas a VirusTotal no estarán disponibles y no se iniciarán escaneos nuevos en urlscan; los análisis locales y los servicios que no requieren clave pueden continuar.
-
-
-## Cómo ejecutar
-
-El argumento obligatorio es un `.eml`, una URL HTTP(S) o la ruta de un archivo. El tipo de entrada determina el análisis.
+El argumento indica el tipo de análisis:
 
 ```bash
-python analisis_recursos.py --help
-python analisis_recursos.py 'muestras/correo.eml'
+python analisis_recursos.py correo.eml
 python analisis_recursos.py 'https://example.org/'
-python analisis_recursos.py 'muestras/archivo.pdf'
+python analisis_recursos.py archivo.pdf
 ```
 
-Estos comandos sirven en Windows, macOS y Linux si el entorno virtual está activado.
+Para un EML también podés reemplazar el contexto SMTP detectado:
 
-## ¿Qué análisis hace?
-
-### Correos `.eml`
-- Verifica SPF, DKIM, DMARC y sus alineaciones; compara `From`, `Reply-To` y `Return-Path` por dominio normalizado.
-- Recorre `Received` desde la cabecera inferior hacia la superior y muestra una sola IP candidata con su cabecera de origen. La cabecera no convierte esa IP en una identidad verificada.
-- Consulta en VirusTotal una vez el dominio `From`. No ejecuta WHOIS/crt.sh para el EML ni consulta VirusTotal para cada IP de `Received`.
-- Extrae URLs y adjuntos. La decodificación Base64/URL es local, acotada y solo alimenta el análisis de URLs; no abre enlaces en la computadora. Cada URL se deriva al flujo de URLs y cada adjunto al flujo estático de archivos.
-- En HTML solo extrae enlaces HTTP(S); no interpreta scripts, atributos inline ni esquemas `javascript:` como alertas del EML.
-- `Authentication-Results` no sustituye las verificaciones reales. MIME ambiguo, contenido no decodificable, capas codificadas o límites alcanzados quedan como brechas de evidencia.
-
-### URLs
-- Consulta la reputación, detecciones y relaciones URL/dominio disponibles en VirusTotal.
-- Con `URLSCAN_API_KEY`, solicita un escaneo privado y registra captura, redirecciones, IP, país, dominios contactados y solicitudes de credenciales.
-- Consulta WHOIS para fecha de creación, registrador y servidores de nombres; consulta crt.sh con `%.dominio` para subdominios y fechas de emisión de certificados.
-- Tu computadora no visita el sitio; urlscan sí lo visita desde sus sistemas. Enviá solo enlaces autorizados.
-
-### Archivos locales y adjuntos
-- Calcula SHA-256 y busca el hash en VirusTotal; no sube el archivo.
-- Informa tamaño real, nombre, tipo detectado, nombres y fechas de primera detección disponibles.
-- Busca estáticamente macros VBA y scripts embebidos cuando corresponde. Nunca ejecuta archivos, scripts ni macros.
-
-### Salida
-- La salida estándar contiene `VEREDICTO` y campos compactos de `AUTENTICACION`, `IDENTIDADES`, `ORIGEN`, `VIRUSTOTAL`, `URLSCAN`, `WHOIS`, `CRT.SH` y `ARCHIVO` cuando aplican.
-- Los errores de proveedor se muestran como estados breves. No se imprimen tutoriales, justificaciones de política ni limitaciones repetidas.
-
-## Flags
-
-`--help` muestra la ayuda. Los siguientes flags son opcionales y aplican al análisis de correo:
-
-| Flag | Uso |
-|---|---|
-| `--smtp-ip IP` | Reemplaza la IP SMTP candidata extraída del EML. |
-| `--mail-from DIRECCIÓN` | Reemplaza el remitente SMTP (`MAIL FROM`). |
-| `--helo HOST` | Reemplaza el nombre HELO/EHLO. |
-| `--trusted-receiver HOST` | Selecciona una cabecera por el receptor exacto; no autentica la cabecera ni hace confiables sus datos. |
-
-El EML es la fuente predeterminada; estos flags sirven para reemplazar candidatos. No existe un flag `--urlscan`: la clave activa el análisis automáticamente.
-
-Ejemplo:
 ```bash
-python analisis_recursos.py correo.eml --smtp-ip 192.0.2.10 --mail-from persona@example.org --helo mail.example.org
+python analisis_recursos.py correo.eml \
+  --smtp-ip 192.0.2.10 \
+  --mail-from persona@example.org \
+  --helo mail.example.org
 ```
+
+Las claves `VT_API_KEY` y `URLSCAN_API_KEY` son opcionales. Sin ellas, las comprobaciones que dependen de esos servicios quedan desconocidas. La salida muestra solo las secciones relevantes para el tipo de recurso y la evidencia disponible.
+
+## Herramientas
+
+| Herramienta | Función y flujo aplicable |
+|---|---|
+| `analisis_recursos.py` | Analizador local que orquesta los flujos de correo, URL y archivo, reúne la evidencia y calcula el veredicto. |
+| VirusTotal | Consulta informes existentes para dominios, URLs y hashes de archivos; no sube archivos ni inicia análisis nuevos. |
+| urlscan.io | Ejecuta, de forma privada y solo para URLs, la comprobación remota de navegación, redirecciones y formularios cuando hay clave configurada. |
+| WHOIS | Consulta los dominios de URLs para aportar edad, registrador y servidores de nombres. |
+| crt.sh | Consulta certificados de los dominios de URLs y sus subdominios. |
+| `dnspython` | Resuelve registros DNS TXT usados por los flujos SPF, DKIM y DMARC de los correos. |
+| `pyspf` | Evalúa SPF con el contexto SMTP disponible en el flujo de correo. |
+| `dkimpy` | Verifica criptográficamente firmas DKIM en correos, como comprobación adicional. |
+| `publicsuffix2` | Normaliza dominios registrables para comparar identidades y agrupar consultas de correo y URL. |
+| `oletools` | Inspecciona estáticamente macros VBA en archivos OLE/OOXML o adjuntos, sin ejecutar su contenido. |
 
 ## Veredictos
 
-- **Legítimo:** evidencia primaria aplicable corroborada: detecciones verificables sin alertas y, para EML/URLs, cada dominio relevante (From y enlaces) debe tener un informe VT válido sin detecciones, registro WHOIS válido con al menos 180 días y reputación comunitaria VT entera positiva. También exige autenticación correcta y alineada e inspección local completa para EML, o comprobaciones estáticas favorables para archivos.
-- **Legítimo aparente — análisis estático:** solo EML con contenido local completamente inspeccionado dentro del alcance compatible y sin alertas observadas, pero con evidencia primaria de autenticación o detecciones/dominio aún no verificada. No confirma autenticidad ni ausencia de amenazas; una firma DKIM ausente no se convierte en autenticación favorable.
-- **No concluyente:** evidencia primaria o inspección local insuficiente, sin una señal afirmativa de riesgo. Un resultado remoto desconocido no equivale a cero detecciones ni a un resultado limpio.
-- **Sospechoso:** señales afirmativas aisladas o mixtas, como detecciones, reputación negativa, fallos de autenticación, cabeceras incoherentes, contenido activo observado en los flujos URL/archivo, solicitudes de credenciales o redirecciones externas. La falta de datos por sí sola no es una amenaza observada.
-- **Infectado:** dos o más motores maliciosos coinciden sobre el mismo recurso; o fallan dos o más comprobaciones distintas de SPF/DKIM/DMARC; o VirusTotal reporta como malicioso el hash de un ejecutable; o hay evidencia corroborada de phishing según las reglas existentes de señal maliciosa y redirección/credenciales.
+- **LIMPIO / LEGÍTIMO:** la evidencia aplicable no presenta detecciones ni fallos relevantes y las comprobaciones necesarias están completas.
+- **SOSPECHOSO:** falta evidencia, hay resultados desconocidos o contradictorios, o aparece algún indicador aislado de riesgo.
+- **INFECTADO:** hay múltiples detecciones maliciosas coincidentes, múltiples fallos verificados de autenticación, phishing corroborado o un ejecutable cuyo hash resulta malicioso.
 
-La precedencia es **Infectado → Sospechoso → evaluación de legitimidad/cobertura**. Una alerta observada prevalece incluso si falta otra evidencia. Para EML y URLs, la antigüedad WHOIS mínima de 180 días, la reputación comunitaria VT entera positiva y un informe VT válido sin detecciones son requisitos conjuntos de **Legítimo** para cada dominio From o de enlace. El flujo EML no realiza WHOIS/crt.sh; por eso la antigüedad del dominio From queda visible como evidencia faltante y no se convierte en una aprobación implícita. Un dato ausente, inválido o insuficiente deja el dominio no verificado y normalmente produce **No concluyente**; una reputación negativa sí es una alerta. Un dominio nuevo por sí solo no demuestra una amenaza. Un informe VT sin motores utilizables tampoco demuestra ausencia de detecciones.
-
-Para archivos, autenticación y dominio no aplican. Un ejecutable o script sin detecciones queda **No concluyente** si su comportamiento no puede corroborarse y no hay otra alerta. Un archivo no ejecutable puede quedar **Legítimo** con detecciones verificables y comprobaciones estáticas favorables. Para URLs, la navegación remota no es un requisito universal de legitimidad; se muestran sus limitaciones y se conservan las alertas disponibles.
-
-La cobertura local completa de un EML se limita a texto plano y extracción estática de enlaces HTTP(S) en HTML. Los adjuntos se incluyen en el inventario y se analizan, pero una brecha local impide un resultado favorable sin evidencia suficiente. La recuperación de enlaces Base64/URL tampoco prueba inspección completa de todas las capas del contenido. Estos casos reciben **No concluyente** si no hay alertas afirmativas.
-
-## Conceptos útiles
-
-- **SPF:** comprueba si la IP de envío está autorizada para el remitente.
-- **DKIM:** verifica la firma criptográfica del correo.
-- **DMARC:** aplica la política del dominio y comprueba alineación con `From`.
-- **WHOIS / crt.sh:** aportan fecha de creación, datos registrales y datos públicos de certificados.
-- **VirusTotal / urlscan.io:** aportan reputación y, en urlscan, navegación remota observada.
-
-El veredicto resume la evidencia disponible y no constituye una garantía absoluta. **No verificado** no significa que la comprobación haya pasado.
+La precedencia es **INFECTADO → SOSPECHOSO → LIMPIO / LEGÍTIMO**. Un resultado **LIMPIO / LEGÍTIMO** no constituye una garantía absoluta de legitimidad; únicamente indica que no se encontraron problemas dentro de la evidencia y los límites del análisis.
