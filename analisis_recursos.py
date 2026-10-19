@@ -12,6 +12,7 @@ import zipfile
 import zlib
 import contextlib
 import io
+import sys
 import threading
 import time
 from email import policy
@@ -90,6 +91,11 @@ ESTABLISHED_DOMAIN_DAYS = 180
 VERDICT_CLEAN = "LIMPIO / LEGÍTIMO"
 VERDICT_SUSPICIOUS = "SOSPECHOSO"
 VERDICT_INFECTED = "INFECTADO"
+
+
+def _notificar_consulta(servicio):
+    """Show provider progress on stderr without changing the structured report."""
+    print(f"CONSULTANDO: {servicio}", file=sys.stderr, flush=True)
 
 
 _vt_analysis_depth = 0
@@ -537,20 +543,246 @@ def _report_value_is_container(value):
     return isinstance(value, (dict, list, tuple, set))
 
 
-def _print_report_value(value, indent=2):
+_REPORT_FIELD_LABELS = {
+    "report_available": "Informe disponible",
+    "reputation": "Reputación",
+    "sha256": "SHA-256",
+    "hash": "Hash",
+    "domain": "Dominio",
+    "domains": "Dominios",
+    "url": "URL",
+    "urls": "URLs",
+    "registration": "Registro",
+    "registration_date": "Fecha de registro",
+    "registration_age_days": "Antigüedad del registro (días)",
+    "certificate": "Certificado",
+    "certificates": "Certificados",
+    "certificate_chain": "Cadena de certificados",
+    "file": "Archivo",
+    "files": "Archivos",
+    "script": "Script",
+    "scripts": "Scripts",
+    "script_status": "Estado del script",
+    "macro": "Macro",
+    "macros": "Macros",
+    "macro_status": "Estado de macros",
+    "relationship": "Relación",
+    "relationships": "Relaciones",
+    "last_serving_ip_address": "Última dirección IP de servicio",
+    "service": "Servicio",
+    "service_issues": "Incidencias del servicio",
+    "reason": "Motivo",
+    "status": "Estado",
+    "report": "Informe",
+    "source": "Origen",
+    "check": "Comprobación",
+    "result": "Resultado",
+    "category": "Categoría",
+    "error": "Error",
+    "name": "Nombre",
+    "names": "Nombres",
+    "size": "Tamaño",
+    "type": "Tipo",
+    "type_basis": "Base del tipo",
+    "extension_type": "Tipo de extensión",
+    "mime": "Tipo MIME",
+    "requirements": "Requisitos",
+    "count": "Cantidad",
+    "last_analysis_stats": "Estadísticas del último análisis",
+    "last_analysis_results": "Resultados del último análisis",
+    "first_submission_date": "Fecha del primer envío",
+    "first_seen": "Visto por primera vez",
+    "last_analysis_date": "Fecha del último análisis",
+    "authentication": "Autenticación",
+    "identities": "Identidades",
+    "origin": "Origen",
+    "virustotal": "VirusTotal",
+    "urlscan": "URLscan",
+    "whois": "WHOIS",
+    "crt_sh": "Certificados CRT.SH",
+    "screenshot": "Captura",
+    "final_url": "URL final",
+    "last_final_url": "Última URL final",
+    "ip": "IP",
+    "ip_addresses": "Direcciones IP",
+    "country": "País",
+    "redirected": "Redirigido",
+    "redirects": "Redirecciones",
+    "redirection_chain": "Cadena de redirecciones",
+    "credentials": "Credenciales",
+    "behavior_observed": "Comportamiento observado",
+    "server": "Servidor",
+    "registrar": "Registrador",
+    "nameservers": "Servidores de nombres",
+    "not_before": "Válido desde",
+    "not_after": "Válido hasta",
+    "entry_timestamp": "Marca de tiempo de entrada",
+    "resource_type": "Tipo de recurso",
+    "resources": "Recursos",
+    "confirmed_phishing": "Phishing confirmado",
+    "high_phishing_risk": "Alto riesgo de phishing",
+    "mixed": "Evidencia mixta",
+    "executable": "Ejecutable",
+    "Authentication-Results": "Authentication-Results",
+    "DKIM_cryptographic": "DKIM criptográfico",
+    "SPF_independent": "SPF independiente",
+    "DMARC_independent": "DMARC independiente",
+    "SPF_alignment": "Alineación SPF",
+    "DKIM_alignment": "Alineación DKIM",
+}
+
+_REPORT_TOKEN_LABELS = {
+    "analysis": "análisis",
+    "address": "dirección",
+    "available": "disponible",
+    "behavior": "comportamiento",
+    "certificate": "certificado",
+    "chain": "cadena",
+    "cryptographic": "criptográfico",
+    "date": "fecha",
+    "description": "descripción",
+    "domain": "dominio",
+    "entry": "entrada",
+    "file": "archivo",
+    "final": "final",
+    "first": "primer",
+    "independent": "independiente",
+    "ip": "IP",
+    "last": "última",
+    "macro": "macro",
+    "name": "nombre",
+    "observed": "observado",
+    "redirect": "redirección",
+    "registration": "registro",
+    "relationship": "relación",
+    "report": "informe",
+    "result": "resultado",
+    "script": "script",
+    "service": "servicio",
+    "serving": "servicio",
+    "size": "tamaño",
+    "source": "origen",
+    "status": "estado",
+    "submission": "envío",
+    "timestamp": "marca de tiempo",
+    "type": "tipo",
+    "url": "URL",
+}
+
+_REPORT_UNAVAILABLE_STATES = {
+    "unknown", "unavailable", "desconocido", "desconocida", "no disponible",
+    "no disponibles", "not available", "not_available", "pending", "pendiente",
+    "not_found", "sin informe", "no verificado", "no verificada", "error", "na", "n/a",
+}
+
+_REPORT_AVAILABLE_STATES = {
+    "available", "disponible", "pass", "sin_detecciones", "sin detecciones",
+    "clean", "malicious", "suspicious", "malicioso", "sospechoso", "fail",
+    "consistent", "inconsistent",
+}
+
+
+def _report_field_key(key):
+    return key.casefold() if isinstance(key, str) else str(key).casefold()
+
+
+def _display_report_key(key, value=None):
+    """Map report keys to stable Spanish labels without changing evidence data."""
+    key_text = _compact_report_value(key, limit=120)
+    normalized = _report_field_key(key_text)
+    if normalized == "malicious":
+        return "Indicador malicioso" if isinstance(value, bool) else "Detecciones maliciosas"
+    if normalized == "suspicious":
+        return "Indicador sospechoso" if isinstance(value, bool) else "Detecciones sospechosas"
+    if normalized == "phishing" and isinstance(value, bool):
+        return "Indicador de phishing"
+    if key_text in _REPORT_FIELD_LABELS:
+        return _REPORT_FIELD_LABELS[key_text]
+    label = _REPORT_FIELD_LABELS.get(normalized)
+    if label:
+        return label
+    if "_" not in key_text:
+        return key_text
+    parts = []
+    for token in key_text.split("_"):
+        parts.append(_REPORT_TOKEN_LABELS.get(token.casefold(), token))
+    label = " ".join(parts).strip()
+    return label[:1].upper() + label[1:] if label else key_text
+
+
+def _report_availability_marker(value):
+    if not isinstance(value, dict):
+        return None
+    report_available = value.get("report_available")
+    available = report_available if isinstance(report_available, bool) else None
+    for key in ("report", "status"):
+        state = value.get(key)
+        if not isinstance(state, str):
+            continue
+        normalized = re.sub(r"\s+", " ", state.strip().casefold())
+        if normalized in _REPORT_UNAVAILABLE_STATES:
+            return False
+        if normalized in _REPORT_AVAILABLE_STATES and available is None:
+            available = True
+    if available is not None:
+        return available
+    if value.get("error"):
+        return False
+    stats = value.get("last_analysis_stats")
+    results = value.get("last_analysis_results")
+    if isinstance(stats, dict) and isinstance(results, dict) and results:
+        return True
+    return None
+
+
+def _report_count_is_available(container, ancestors, context):
+    candidates = [container]
+    candidates.extend(ancestors)
+    evidence = context.get("evidence") if isinstance(context, dict) else None
+    if isinstance(evidence, dict):
+        candidates.append(evidence)
+    seen = set()
+    for candidate in candidates:
+        if not isinstance(candidate, dict) or id(candidate) in seen:
+            continue
+        seen.add(id(candidate))
+        marker = _report_availability_marker(candidate)
+        if marker is not None:
+            return marker
+    return None
+
+
+def _display_report_scalar(key, value, container, ancestors, context):
+    """Format one scalar while preserving canonical evidence statuses."""
+    label = _display_report_key(key, value)
+    normalized = _report_field_key(key)
+    if normalized in ("malicious", "suspicious") and isinstance(value, int) and not isinstance(value, bool):
+        if _report_count_is_available(container, ancestors, context) is False:
+            return label, "no disponibles"
+        if value == 0:
+            return label, "ninguna"
+        return label, _compact_report_value(value)
+    if isinstance(value, bool):
+        return label, "sí" if value else "no"
+    return label, _compact_report_value(value)
+
+
+def _print_report_value(value, indent=2, context=None, ancestors=()):
     """Print report values as bounded, deterministic, YAML-like evidence."""
+    context = context if isinstance(context, dict) else {}
     prefix = " " * indent
     if isinstance(value, dict):
         for key, item in sorted(value.items(), key=lambda pair: str(pair[0])):
             item = _meaningful_report_value(item)
             if item is None:
                 continue
-            key_text = _compact_report_value(key, limit=120)
             if _report_value_is_container(item):
+                key_text = _display_report_key(key, item)
                 print(f"{prefix}{key_text}:")
-                _print_report_value(item, indent + 2)
+                _print_report_value(item, indent + 2, context=context, ancestors=(value,) + tuple(ancestors))
             else:
-                print(f"{prefix}{key_text}: {_compact_report_value(item)}")
+                key_text, value_text = _display_report_scalar(key, item, value, ancestors, context)
+                print(f"{prefix}{key_text}: {value_text}")
         return
     if isinstance(value, (list, tuple, set)):
         values = sorted(value, key=lambda item: _compact_report_value(item)) if isinstance(value, set) else value
@@ -560,19 +792,21 @@ def _print_report_value(value, indent=2):
                 continue
             if _report_value_is_container(item):
                 print(f"{prefix}-")
-                _print_report_value(item, indent + 2)
+                _print_report_value(item, indent + 2, context=context, ancestors=ancestors)
             else:
-                print(f"{prefix}- {_compact_report_value(item)}")
+                scalar = "sí" if item is True else "no" if item is False else _compact_report_value(item)
+                print(f"{prefix}- {scalar}")
         return
-    print(f"{prefix}{_compact_report_value(value)}")
+    scalar = "sí" if value is True else "no" if value is False else _compact_report_value(value)
+    print(f"{prefix}{scalar}")
 
 
-def _print_report_section(label, value):
+def _print_report_section(label, value, evidence=None):
     value = _meaningful_report_value(value)
     if value is None:
         return
     print(f"{label}:")
-    _print_report_value(value)
+    _print_report_value(value, context={"section": label, "evidence": evidence})
 
 
 def _criteria_sort_key(item):
@@ -639,7 +873,7 @@ def imprimir_veredicto(evidencia):
     applicable = resource_sections.get(evidencia.get("resource_type"), set())
     for label, key in sections:
         if key in applicable:
-            _print_report_section(label, report.get(key))
+            _print_report_section(label, report.get(key), evidence=evidencia)
     criteria = evidencia.get("criteria", {}) if isinstance(evidencia, dict) else {}
     _print_criteria_section(criteria)
     issues = []
@@ -820,6 +1054,7 @@ def consultar_urlscan_privado(url):
         return {"status": "unknown", "reason": "URLscan omitido: URL no apta para envío privado"}
     issues = []
     try:
+        _notificar_consulta("urlscan.io")
         submitted = _urlscan_request(f"{URLSCAN_BASE_URL}/scan", json.dumps({"url": url, "visibility": "private"}).encode())
         task = submitted.get("task", submitted)
         scan_id = task.get("uuid")
@@ -1058,6 +1293,7 @@ def analizar_macros_local(path, size, detected):
         if detected == "ZIP/OOXML":
             _validar_metadatos_zip_macros(path)
         from oletools.olevba import VBA_Parser
+        _notificar_consulta("oletools")
         parser = VBA_Parser(os.fspath(path))
         try:
             if not parser.detect_vba_macros():
@@ -1314,6 +1550,7 @@ def consultar_crtsh(dominio):
     """Query crt.sh for certificates covering the domain or its subdomains."""
     request = Request(f"{CRT_SH_URL}?q={quote('%.' + dominio)}&output=json", headers={"accept": "application/json"})
     try:
+        _notificar_consulta("crt.sh")
         with urlopen(request, timeout=LOOKUP_TIMEOUT) as respuesta:
             raw = respuesta.read(MAX_INTEL_BYTES + 1)
         if len(raw) > MAX_INTEL_BYTES:
@@ -1391,6 +1628,7 @@ def consultar_whois(dominio):
         return {"error": "Dominio no válido para consulta WHOIS"}
     dominio = dominio.lower().rstrip(".")
     try:
+        _notificar_consulta("WHOIS")
         iana = _consulta_whois(WHOIS_IANA_SERVER, dominio)
         referral = re.search(r"(?im)^refer:\s*(\S+)\s*$", iana)
         if not referral:
@@ -1426,6 +1664,7 @@ def _safe_domain(value):
 
 def _provider_json(url, headers=None):
     request = Request(url, headers=headers or {"accept": "application/json"})
+    _notificar_consulta("VirusTotal")
     with urlopen(request, timeout=LOOKUP_TIMEOUT) as response:
         raw = response.read(MAX_INTEL_BYTES + 1)
     if len(raw) > MAX_INTEL_BYTES:
@@ -1720,6 +1959,7 @@ def _dns_txt(name, timeout=5):
 
 def _dkim_dns_record(name, timeout=5):
     """Adapt the multi-record DNS API to dkimpy's one raw TXT-record contract."""
+    _notificar_consulta("DNS (DKIM)")
     records = _dns_txt(name, timeout=timeout)
     candidates = []
     for record in records:
@@ -1781,6 +2021,7 @@ def verificar_spf(smtp_ip=None, mail_from=None, helo=None):
         return "unknown", "contexto SMTP inválido"
     try:
         import spf
+        _notificar_consulta("DNS (SPF)")
         status, _ = spf.check2(i=smtp_ip, s=mail_from, h=helo, querytime=5)
         reason = "evaluación pyspf de la tupla SMTP; confianza del origen evaluada por separado"
         if status.lower() == "temperror":
@@ -1810,6 +2051,7 @@ def _alineado(domain, from_domain, strict):
 
 def _dmarc_records(domain):
     try:
+        _notificar_consulta("DNS (DMARC)")
         answers = _dns_txt(f"_dmarc.{domain}")
     except Exception as error:
         if type(error).__name__ in ("NXDOMAIN", "NoAnswer"):
