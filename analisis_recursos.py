@@ -176,7 +176,12 @@ def consultar_virustotal(url):
         if not isinstance(attributes, dict) or not validar_informe_vt(attributes):
             result = _service_error("VirusTotal", "Informe de VirusTotal incompleto o no válido")
         else:
-            result = attributes
+            result = dict(attributes)
+            # GUI URLs require VT's canonical ID, not the base64 API lookup ID.
+            result.pop("_vt_gui_id", None)
+            canonical_id = datos["data"].get("id")
+            if _vt_gui_url("url", canonical_id):
+                result["_vt_gui_id"] = canonical_id.lower()
 
     except HTTPError as error:
         if error.code == 404:
@@ -545,6 +550,10 @@ def _report_value_is_container(value):
 
 _REPORT_FIELD_LABELS = {
     "report_available": "Informe disponible",
+    "detections_available": "Datos de detección utilizables",
+    "report_url": "URL del informe en VirusTotal",
+    "report_url_reason": "URL del informe no disponible",
+    "scope": "Alcance de las consultas",
     "reputation": "Reputación",
     "sha256": "SHA-256",
     "hash": "Hash",
@@ -681,21 +690,222 @@ _REPORT_AVAILABLE_STATES = {
     "consistent", "inconsistent",
 }
 
+_REPORT_CONTEXT_LABELS = {
+    "VIRUSTOTAL": {
+        "reputation": "Puntuación comunitaria de VirusTotal (votos, no motores)",
+        "requirements": "Condiciones conjuntas del criterio de dominio",
+        "relationships": "Relaciones de la URL en VirusTotal",
+        "first_seen": "Primera observación según VirusTotal",
+        "first_submission_date": "Primer envío según VirusTotal",
+        "last_analysis_date": "Último análisis según VirusTotal",
+    },
+    "VT_RELATIONSHIPS": {
+        "last_serving_ip_address": "Última IP asociada a la URL (sin evaluar su reputación)",
+    },
+    "URLSCAN": {
+        "status": "Resultado de URLscan",
+        "credentials": "Campo de contraseña en el contenido de la página",
+        "behavior_observed": "Evidencia de navegación remota completa",
+        "uuid": "Identificador de la tarea de URLscan", "time": "Fecha de envío de la tarea de URLscan",
+        "screenshot": "URL de captura construida (disponibilidad no comprobada)",
+        "final_url": "URL final observada por URLscan", "ip": "IP de la página observada por URLscan",
+        "country": "País de la IP de la página (no del remitente)",
+        "domains": "Dominios observados en la página remota",
+        "redirects": "Redirecciones observadas por URLscan", "redirected": "URLscan observó redirecciones",
+    },
+    "WHOIS": {
+        "registration_date": "Fecha de creación extraída del registro WHOIS",
+        "registration_age_days": "Antigüedad según WHOIS (días)",
+        "registrar": "Registrador indicado por WHOIS", "nameservers": "Servidores DNS indicados por WHOIS",
+    },
+    "CRT.SH": {
+        "count": "Nombres de dominio distintos coincidentes en CRT.SH",
+        "certificates": "Fechas declaradas de los certificados encontrados",
+    },
+    "CERTIFICATE": {
+        "not_before": "Inicio de validez declarado del certificado",
+        "not_after": "Fin de validez declarado del certificado",
+        "entry_timestamp": "Fecha de incorporación al registro de certificados",
+    },
+    "AUTENTICACION": {
+        "spf": "Resultado usado de SPF (autorización de la IP de envío)",
+        "dkim": "Resultado usado de DKIM (firma de partes del correo)",
+        "dmarc": "Resultado usado de DMARC (política y coincidencia del dominio remitente)",
+        "spf_independent": "SPF recalculado (autorización de la IP para el dominio de envío)",
+        "dkim_cryptographic": "Verificación criptográfica DKIM (partes firmadas del correo)",
+        "dmarc_independent": "DMARC recalculado (política de From y coincidencia con SPF o DKIM)",
+        "spf_alignment": (
+            "Coincidencia de dominios entre el envío del sobre (MAIL FROM) "
+            "y el remitente declarado (From)"),
+        "dkim_alignment": "Firma DKIM verificada cuyo dominio corresponde al remitente declarado (From)",
+        "authentication-results": "Authentication-Results (declaraciones de cabecera, sin verificar)",
+        "contradictions": "Desacuerdos entre comprobaciones y cabeceras",
+    },
+    "AUTH_HEADER": {"source": "Cabecera de origen", "status": "Resultado declarado en cabecera"},
+    "AUTH_CONTRADICTIONS": {
+        "independent": "Resultado independiente", "header": "Resultado declarado en cabecera",
+    },
+    "IDENTIDADES": {
+        "from": "Dominio del remitente declarado (From)", "reply-to": "Dominio indicado para responder (Reply-To)",
+        "return-path": "Dominio para devoluciones (Return-Path)", "status": "Comparación de identidades",
+    },
+    "ORIGEN": {
+        "ip": "IP candidata del salto de correo seleccionado (Received; sin verificar)",
+        "header": "Cabecera del salto de correo seleccionado",
+        "receiver": "Receptor indicado en cabecera (sin verificar)", "status": "Estado del origen",
+    },
+    "ARCHIVO": {
+        "type": "Tipo estimado por marcas del formato y análisis acotado",
+        "type_basis": "Base de la estimación del tipo",
+        "extension_type": "Tipo sugerido por la extensión del nombre",
+        "mime": "Tipo de contenido declarado o proporcionado (MIME)",
+        "size": "Tamaño local (bytes)", "scripts": "Scripts embebidos (búsqueda estática acotada)",
+        "macros": "Macros (inspección estática; véase cobertura)",
+        "vt_metadata": "Metadatos comunicados por VirusTotal",
+    },
+    "VT_METADATA": {
+        "type_description": "Descripción del tipo según VirusTotal", "type_tag": "Etiqueta del tipo según VirusTotal",
+        "size": "Tamaño según VirusTotal (bytes)", "first_seen": "Primera observación según VirusTotal",
+        "first_submission_date": "Primer envío según VirusTotal", "last_analysis_date": "Último análisis según VirusTotal",
+    },
+    "CRITERIO": {"evidence": "Detalle técnico original"},
+    "SERVICE_ISSUE": {"reason": "Detalle técnico original", "error": "Detalle técnico original"},
+}
+
+_REPORT_SECTION_NOTES = {
+    "VIRUSTOTAL": "La puntuación comunitaria resume votos con signo. No es una probabilidad ni una prueba de seguridad.",
+    "URLSCAN": "Observaciones de la página remota; los indicadores no son conteos de motores ni datos del remitente.",
+    "WHOIS": "Datos del registro del dominio; su antigüedad no demuestra legitimidad.",
+    "CRT.SH": "Nombres y fechas asociados a certificados, sin comprobar su despliegue actual ni la seguridad del sitio.",
+    "AUTENTICACION": (
+        "Los resultados efectivos pueden usar declaraciones de cabecera sin verificar; "
+        "el informe no identifica siempre su procedencia. Consulte las comprobaciones independientes. "
+        "El contexto SMTP puede proceder de cabeceras no verificadas."),
+    "IDENTIDADES": (
+        "Se comparan dominios normalizados, no direcciones completas ni identidad real; "
+        "pueden faltar identidades opcionales."),
+    "ORIGEN": (
+        "Un candidato de cabecera no es una ubicación verificada del remitente ni la cadena completa; "
+        "las cabeceras no establecen confianza."),
+    "ARCHIVO": (
+        "Se realiza una inspección estática acotada, sin ejecutar el contenido; "
+        "lo no observado puede quedar fuera de su cobertura."),
+    "ESTADO": "Estos servicios no aportaron evidencia completa; consulte el detalle técnico original de cada incidencia.",
+    "ALERTAS": "Se muestran causas concretas del análisis; cada entrada conserva su detalle técnico original.",
+}
+
+_REPORT_CHECK_STATES = {
+    "pass": "condición cumplida (pass)", "fail": "condición no cumplida (fail)",
+    "unknown": "no determinado (unknown); evidencia insuficiente o no verificada",
+    "unavailable": "no disponible (unavailable); no se pudo ejecutar la comprobación",
+    "na": "no aplica a este recurso (na)",
+}
+_REPORT_AUTH_STATES = {
+    "pass": "resultado favorable (pass)", "fail": "resultado desfavorable (fail)",
+    "softfail": "resultado desfavorable débil (softfail)", "neutral": "resultado neutral (neutral)",
+    "none": "sin autenticación acreditada (none)", "unknown": "no determinado (unknown)",
+    "unavailable": "comprobación no disponible (unavailable)",
+    "temperror": "error transitorio (temperror)", "permerror": "error permanente (permerror)",
+}
+_REPORT_DKIM_STATES = {
+    "verified": "firma verificada (verified)", "failed": "firma no válida (failed)",
+    "unavailable": "verificación no disponible (unavailable)", "unknown": "no determinado (unknown)",
+}
+_REPORT_NULL_CHECK_FIELDS = {
+    "URLSCAN": {"status", "malicious", "suspicious", "phishing", "credentials", "behavior_observed", "redirected"},
+    "WHOIS": {"registration_date", "registration_age_days"},
+    "AUTENTICACION": {"spf", "dkim", "dmarc", "spf_independent", "dmarc_independent",
+                      "dkim_cryptographic", "spf_alignment", "dkim_alignment"},
+    "VIRUSTOTAL": {"status", "malicious", "suspicious", "reputation", "detections_available", "report_available"},
+    "CRT.SH": {"count"}, "CRITERIO": {"status"},
+}
+
 
 def _report_field_key(key):
     return key.casefold() if isinstance(key, str) else str(key).casefold()
 
 
-def _display_report_key(key, value=None):
+def _report_child_context(key, context):
+    """Enter only known report structures; arbitrary nested evidence stays opaque."""
+    normalized = _report_field_key(key)
+    path = context.get("path", ())
+    child = dict(context, path=path + (normalized,))
+    if path:
+        return child
+    section = context.get("section")
+    if section == "VIRUSTOTAL" and normalized in ("url", "urls", "domain", "domains", "file", "files"):
+        kind = {"url": "url", "urls": "url", "domain": "domain", "domains": "domain",
+                "file": "file", "files": "file"}[normalized]
+        if kind == "file" and context.get("root_resource_type") == "eml":
+            kind = "attachment"
+        child.update(path=(), resource_type=kind)
+    sections = {
+        ("VIRUSTOTAL", "virustotal"): "VIRUSTOTAL", ("VIRUSTOTAL", "whois"): "WHOIS",
+        ("VIRUSTOTAL", "crt_sh"): "CRT.SH", ("VIRUSTOTAL", "relationships"): "VT_RELATIONSHIPS",
+        ("ARCHIVO", "vt_metadata"): "VT_METADATA", ("CRT.SH", "certificates"): "CERTIFICATE",
+        ("AUTENTICACION", "authentication-results"): "AUTH_HEADER",
+        ("AUTENTICACION", "contradictions"): "AUTH_CONTRADICTIONS",
+    }
+    if section == "ESTADO" or (normalized == "service_issues" and
+                               section in ("VIRUSTOTAL", "URLSCAN", "WHOIS", "CRT.SH")):
+        child.update(section="SERVICE_ISSUE", path=())
+    if (section, normalized) in sections:
+        child.update(section=sections[(section, normalized)], path=())
+    return child
+
+
+def _report_display_view(value, context):
+    """Copy present null check cells before pruning, without inventing absent checks."""
+    if isinstance(value, dict):
+        view = {}
+        for key, item in value.items():
+            known_null = (not context.get("path") and _report_field_key(key) in
+                          _REPORT_NULL_CHECK_FIELDS.get(context.get("section"), set()))
+            view[key] = ("no determinado; no se pudo comprobar" if item is None and known_null
+                         else _report_display_view(item, _report_child_context(key, context)))
+        return view
+    if isinstance(value, (list, tuple, set)):
+        values = sorted(value, key=_compact_report_value) if isinstance(value, set) else value
+        return [_report_display_view(item, context) for item in values]
+    return value
+
+
+def _report_enum(value, meanings):
+    return meanings.get(value, _compact_report_value(value)) if isinstance(value, str) else _compact_report_value(value)
+
+
+def _display_report_key(key, value=None, context=None):
     """Map report keys to stable Spanish labels without changing evidence data."""
     key_text = _compact_report_value(key, limit=120)
     normalized = _report_field_key(key_text)
-    if normalized == "malicious":
-        return "Indicador malicioso" if isinstance(value, bool) else "Detecciones maliciosas"
-    if normalized == "suspicious":
-        return "Indicador sospechoso" if isinstance(value, bool) else "Detecciones sospechosas"
-    if normalized == "phishing" and isinstance(value, bool):
-        return "Indicador de phishing"
+    context = context or {}
+    section = context.get("section")
+    path = context.get("path", ())
+    if not path:
+        label = _REPORT_CONTEXT_LABELS.get(section, {}).get(normalized)
+        if label:
+            return label
+        if normalized in ("reason", "error") and section in ("VIRUSTOTAL", "URLSCAN", "WHOIS", "CRT.SH"):
+            return "Detalle técnico original"
+    if section == "URLSCAN" and not path and normalized in ("malicious", "suspicious", "phishing"):
+        return {"malicious": "Indicador malicioso", "suspicious": "Indicador sospechoso",
+                "phishing": "Indicador de phishing"}[normalized]
+    if (section == "VIRUSTOTAL" and path in ((), ("last_analysis_stats",)) and
+            normalized in ("malicious", "suspicious")):
+        adjective = "malicioso" if normalized == "malicious" else "sospechoso"
+        if isinstance(value, bool):
+            return f"Indicador {adjective}"
+        kind = context.get("resource_type")
+        resource = {"file": "al archivo", "url": "a la URL", "domain": "al dominio",
+                    "attachment": "al adjunto"}.get(kind, "al recurso")
+        if kind == "url":
+            adjective = adjective[:-1] + "a"
+        return f"Motores que marcaron {resource} como {adjective}"
+    if normalized == "names" and not path:
+        if section == "CRT.SH":
+            return "Dominios observados en certificados"
+        if section in ("VIRUSTOTAL", "VT_METADATA") and context.get("resource_type") in ("file", "attachment"):
+            return "Nombres de archivo observados en VirusTotal"
     if key_text in _REPORT_FIELD_LABELS:
         return _REPORT_FIELD_LABELS[key_text]
     label = _REPORT_FIELD_LABELS.get(normalized)
@@ -713,6 +923,9 @@ def _display_report_key(key, value=None):
 def _report_availability_marker(value):
     if not isinstance(value, dict):
         return None
+    # Report retrieval and usable engine evidence are independent display facts.
+    if isinstance(value.get("detections_available"), bool):
+        return value["detections_available"]
     report_available = value.get("report_available")
     available = report_available if isinstance(report_available, bool) else None
     for key in ("report", "status"):
@@ -752,16 +965,107 @@ def _report_count_is_available(container, ancestors, context):
     return None
 
 
+def _display_vt_report_url(value):
+    """Validate the complete target before adding terminal-owned OSC 8 controls."""
+    pattern = r"https://www\.virustotal\.com/gui/(file|url|domain)/([^/?#]+)/detection"
+    match = re.fullmatch(pattern, value) if isinstance(value, str) else None
+    if not match or _vt_gui_url(*match.groups()) != value:
+        return "no disponible (enlace no válido)"
+    if sys.stdout.isatty():
+        return f"\x1b]8;;{value}\x1b\\{value}\x1b]8;;\x1b\\"
+    return value
+
+
 def _display_report_scalar(key, value, container, ancestors, context):
     """Format one scalar while preserving canonical evidence statuses."""
-    label = _display_report_key(key, value)
+    label = _display_report_key(key, value, context)
     normalized = _report_field_key(key)
-    if normalized in ("malicious", "suspicious") and isinstance(value, int) and not isinstance(value, bool):
+    section = context.get("section")
+    path = context.get("path", ())
+    owned = not path
+    if normalized == "report_url" and section == "VIRUSTOTAL" and owned:
+        return label, _display_vt_report_url(value)
+    if section == "VIRUSTOTAL" and owned:
+        availability_status = normalized == "status" and (
+            (context.get("resource_type") == "attachment" and value in ("available", "unknown")) or
+            value == "available")
+        if normalized in ("report", "report_available") or availability_status:
+            available = value is True or value == "available"
+            text = ("existe y se puede consultar (sujeto a las condiciones de acceso de VirusTotal)"
+                    if available else "disponibilidad no determinada")
+            if container.get("reason") in ("URL sin informe disponible en VirusTotal",
+                                            "Archivo sin informe disponible en VirusTotal",
+                                            "VirusTotal HTTP 404"):
+                text = "no se encontró un informe para este recurso"
+            if isinstance(value, str) and value not in ("available", "unknown"):
+                text += "; detalle original: " + _compact_report_value(value)
+            return "Informe en VirusTotal", _compact_report_value(text)
+        if normalized == "status":
+            text = {"pass": "sin detecciones en los motores consultados (pass)", "fail": "con detecciones (fail)",
+                    "sin_detecciones": "sin detecciones en los motores consultados",
+                    "unknown": "no determinado (unknown)", "desconocido": "no determinado (desconocido)",
+                    "malicioso": "clasificación de riesgo malicioso (malicioso)",
+                    "sospechoso": "clasificación de riesgo sospechoso (sospechoso)"}
+            label = ("Clasificación de la URL en VirusTotal" if context.get("resource_type") == "url"
+                     else "Estado de las detecciones")
+            return label, _report_enum(value, text)
+        if normalized == "requirements" and value == "VT_clean; WHOIS_age>=180d; reputation>0":
+            return label, "datos VT utilizables sin detecciones Y antigüedad WHOIS >= 180 días Y puntuación comunitaria > 0"
+    if (section == "VIRUSTOTAL" and path in ((), ("last_analysis_stats",)) and
+            normalized in ("malicious", "suspicious") and isinstance(value, int) and not isinstance(value, bool)):
         if _report_count_is_available(container, ancestors, context) is False:
             return label, "no disponibles"
-        if value == 0:
-            return label, "ninguna"
         return label, _compact_report_value(value)
+    if section == "URLSCAN" and owned:
+        if normalized == "status":
+            return label, _report_enum(value, {
+                "unknown": "no determinado (unknown); no clasifica la página como limpia",
+                "suspicious": "señales de riesgo comunicadas por URLscan (suspicious)",
+                "unavailable": "comprobación no disponible (unavailable)",
+            })
+        if normalized in ("malicious", "suspicious", "phishing"):
+            if isinstance(value, bool):
+                text = "sí (señal comunicada por URLscan)" if value else "no (URLscan no lo señaló; no establece seguridad)"
+                return label, text
+            return label, _report_enum(value, {
+                "unknown": "no determinado (unknown)", "unavailable": "comprobación no disponible (unavailable)",
+            })
+        if normalized == "credentials":
+            return label, _report_enum(value, {
+                "password_input": "observado; no demuestra robo de credenciales (password_input)",
+                "not_observed": "no observado en el contenido consultado de la página (not_observed)",
+                "unknown": "no se pudo comprobar el contenido de la página (unknown)",
+            })
+        if normalized == "behavior_observed" and isinstance(value, bool):
+            return label, "sí" if value else "no (evidencia remota incompleta)"
+    if section == "AUTENTICACION" and owned:
+        if normalized in ("spf", "dkim", "dmarc", "spf_independent", "dmarc_independent"):
+            return label, _report_enum(value, _REPORT_AUTH_STATES)
+        if normalized == "dkim_cryptographic" and isinstance(value, str):
+            states = value.split(",")
+            if all(state in _REPORT_DKIM_STATES for state in states):
+                return label, _compact_report_value("; ".join(_REPORT_DKIM_STATES[state] for state in states))
+        if normalized == "dkim_alignment" and isinstance(value, bool):
+            return label, "sí" if value else "no (no acredita desalineación)"
+        if normalized == "spf_alignment" and isinstance(value, bool):
+            text = "sí (comparación de dominios, no autenticación por sí sola)" if value else "no (alineación no acreditada)"
+            return label, text
+    if owned and ((section == "AUTH_HEADER" and normalized == "status") or
+                  (section == "AUTH_CONTRADICTIONS" and normalized in ("independent", "header"))):
+        return label, _report_enum(value, _REPORT_AUTH_STATES)
+    if section == "IDENTIDADES" and owned and normalized == "status":
+        return label, _report_enum(value, {
+            "consistent": "coherentes entre los dominios interpretables disponibles (consistent)",
+            "inconsistent": "dominios distintos o identidad malformada, múltiple o ambigua (inconsistent)",
+            "incomplete": "comparación incompleta; falta un From interpretable (incomplete)",
+        })
+    if section == "ORIGEN" and owned and normalized == "status":
+        return label, _report_enum(value, {
+            "candidata-no-verificada": "candidato de cabecera sin verificar (candidata-no-verificada)",
+            "no-determinada": "no se pudo seleccionar una IP de cabecera (no-determinada)",
+        })
+    if section == "ARCHIVO" and owned and normalized == "type" and value == "PE":
+        return label, "PE (firma MZ; cabecera PE no validada)"
     if isinstance(value, bool):
         return label, "sí" if value else "no"
     return label, _compact_report_value(value)
@@ -777,9 +1081,11 @@ def _print_report_value(value, indent=2, context=None, ancestors=()):
             if item is None:
                 continue
             if _report_value_is_container(item):
-                key_text = _display_report_key(key, item)
+                key_text = (_compact_report_value(key, limit=120) if context.get("section") == "ESTADO"
+                            else _display_report_key(key, item, context))
                 print(f"{prefix}{key_text}:")
-                _print_report_value(item, indent + 2, context=context, ancestors=(value,) + tuple(ancestors))
+                child_context = _report_child_context(key, context)
+                _print_report_value(item, indent + 2, context=child_context, ancestors=(value,) + tuple(ancestors))
             else:
                 key_text, value_text = _display_report_scalar(key, item, value, ancestors, context)
                 print(f"{prefix}{key_text}: {value_text}")
@@ -802,11 +1108,17 @@ def _print_report_value(value, indent=2, context=None, ancestors=()):
 
 
 def _print_report_section(label, value, evidence=None):
-    value = _meaningful_report_value(value)
+    kind = evidence.get("resource_type") if isinstance(evidence, dict) else None
+    resource = "attachment" if kind == "eml" and label == "ARCHIVO" else kind
+    context = {"section": label, "evidence": evidence, "path": (),
+               "resource_type": resource, "root_resource_type": kind}
+    value = _meaningful_report_value(_report_display_view(value, context))
     if value is None:
         return
     print(f"{label}:")
-    _print_report_value(value, context={"section": label, "evidence": evidence})
+    if label in _REPORT_SECTION_NOTES:
+        print(f"  Alcance: {_REPORT_SECTION_NOTES[label]}")
+    _print_report_value(value, context=context)
 
 
 def _criteria_sort_key(item):
@@ -815,37 +1127,71 @@ def _criteria_sort_key(item):
     return (0, preferred.index(key)) if key in preferred else (1, key)
 
 
-def _print_criteria_section(criteria):
+def _report_criterion_label(key, resource_type):
+    labels = {
+        "authentication": "Autenticación del correo" if resource_type == "eml" else "Autenticación de correo",
+        "domain": {"eml": "Dominios del remitente y de las URLs", "url": "Dominio de la URL"}.get(
+            resource_type, "Reputación de dominio"),
+        "detections": {"eml": "Detecciones en dominios, URLs y adjuntos", "url": "Detecciones de la URL"}.get(
+            resource_type, "Detecciones del archivo"),
+        "behavior": {"eml": "Inspección local del correo y adjuntos", "url": "Inspección de contenido local"}.get(
+            resource_type, "Inspección estática del archivo"),
+        "remote_behavior": ("Comportamiento remoto de las URLs extraídas" if resource_type == "eml"
+                            else "Comportamiento remoto de la URL"),
+        "community_reputation": "Puntuación comunitaria positiva",
+    }
+    return labels.get(key, _compact_report_value(key, limit=120))
+
+
+def _print_criteria_section(criteria, resource_type=None, label="CRITERIOS"):
     if not isinstance(criteria, dict):
         return
     entries = []
+    context = {"section": "CRITERIO", "path": ()}
     for key, value in criteria.items():
-        value = _meaningful_report_value(value)
+        value = _meaningful_report_value(_report_display_view(value, context))
         if value is not None:
             entries.append((key, value))
     if not entries:
         return
 
-    print("CRITERIOS:")
+    print(f"{label}:")
+    print("  Alcance: Cumplir un criterio no establece seguridad; incumplirlo no implica por sí solo contenido malicioso.")
     for key, value in sorted(entries, key=_criteria_sort_key):
-        key_text = _compact_report_value(key, limit=120)
+        key_text = _report_criterion_label(key, resource_type)
+        known = key in ("authentication", "domain", "detections", "behavior", "remote_behavior", "community_reputation")
+        meanings = _REPORT_CHECK_STATES if known else {}
         if isinstance(value, dict):
             status = value.get("status", "unknown")
             details = dict(value)
             details.pop("status", None)
             if _report_value_is_container(status):
                 print(f"  {key_text}:")
-                _print_report_value(value, 4)
+                _print_report_value(value, 4, context=context)
             else:
-                print(f"  {key_text}: {_compact_report_value(status)}")
+                print(f"  {key_text}: {_report_enum(status, meanings)}")
+                if key == "domain" and resource_type in ("url", "eml"):
+                    print("    Comprobación: datos VT utilizables sin detecciones, antigüedad WHOIS >= 180 días "
+                          "y puntuación comunitaria positiva; se requieren las tres condiciones.")
                 details = _meaningful_report_value(details)
                 if details is not None:
-                    _print_report_value(details, 4)
+                    _print_report_value(details, 4, context=context)
         elif _report_value_is_container(value):
             print(f"  {key_text}:")
-            _print_report_value(value, 4)
+            _print_report_value(value, 4, context=context)
         else:
-            print(f"  {key_text}: {_compact_report_value(value)}")
+            print(f"  {key_text}: {_report_enum(value, meanings)}")
+
+
+def _display_report_summary(reason, resource_type):
+    # Translate only evaluator-owned criterion lists, never provider/evidence text.
+    for prefix in ("evidencia no verificada: ", "criterios con resultado desfavorable: "):
+        if isinstance(reason, str) and reason.startswith(prefix):
+            keys = reason[len(prefix):].split(", ")
+            if all(key in ("authentication", "domain", "detections", "behavior", "remote_behavior", "community_reputation")
+                   for key in keys):
+                return prefix + ", ".join(_report_criterion_label(key, resource_type) for key in keys)
+    return reason
 
 
 def imprimir_veredicto(evidencia):
@@ -853,6 +1199,7 @@ def imprimir_veredicto(evidencia):
     verdict, reasons = evaluar_evidencia(evidencia)
     print(f"VEREDICTO: {verdict}")
     summary = reasons[0] if reasons else "evidencia insuficiente o no verificada"
+    summary = _display_report_summary(summary, evidencia.get("resource_type"))
     print(f"RESUMEN: {_compact_report_value(summary, limit=180)}")
     report = evidencia.get("report", {}) if isinstance(evidencia, dict) else {}
     sections = (
@@ -875,13 +1222,17 @@ def imprimir_veredicto(evidencia):
         if key in applicable:
             _print_report_section(label, report.get(key), evidence=evidencia)
     criteria = evidencia.get("criteria", {}) if isinstance(evidencia, dict) else {}
-    _print_criteria_section(criteria)
+    _print_criteria_section(criteria, evidencia.get("resource_type"))
+    _print_criteria_section(evidencia.get("optional_criteria"), evidencia.get("resource_type"), "CRITERIOS COMPLEMENTARIOS")
     issues = []
     for item in evidencia.get("service_issues", []) if isinstance(evidencia, dict) else []:
         if isinstance(item, dict) and item.get("service") and item.get("reason"):
             issues.append((str(item["service"]), str(item["reason"])))
     if issues:
-        _print_report_section("ESTADO", {service: reason for service, reason in sorted(set(issues))})
+        diagnostics = {}
+        for service, reason in sorted(set(issues)):
+            diagnostics.setdefault(service, []).append({"reason": reason})
+        _print_report_section("ESTADO", diagnostics)
     alerts = [str(item) for item in evidencia.get("concrete_causes", []) if item]
     if alerts:
         _print_report_section("ALERTAS", list(dict.fromkeys(alerts))[:2])
@@ -901,6 +1252,39 @@ def resumen_vt(attributes):
               if item.get('category') in ('malicious', 'suspicious')]
     return {"report_available": True, "malicious": malicious, "suspicious": suspicious,
             "concrete_causes": causes}
+
+
+def _vt_gui_url(kind, identifier):
+    """Build fixed-origin report links only from validated resource identities."""
+    if not isinstance(identifier, str) or re.search(r"[\s\x00-\x1f\x7f-\x9f]", identifier):
+        return None
+    if kind in ("file", "url"):
+        if not re.fullmatch(r"[a-fA-F0-9]{64}", identifier):
+            return None
+        identifier = identifier.lower()
+    elif kind == "domain":
+        identifier = _normalizar_dominio(identifier)
+        if not _safe_domain(identifier) or extraer_dominio("https://" + identifier) != identifier:
+            return None
+    else:
+        return None
+    return f"https://www.virustotal.com/gui/{kind}/{quote(identifier, safe='')}/detection"
+
+
+def _vt_report_presentation(report, kind, identifier):
+    """Expose retrieval metadata without changing normalized detection evidence."""
+    available = "error" not in report and validar_informe_vt(report)
+    fields = {"report": "available" if available else "unknown",
+              "detections_available": available and criterio_detecciones(report)["status"] != "unknown"}
+    if available:
+        link = _vt_gui_url(kind, identifier)
+        if link:
+            fields["report_url"] = link
+        else:
+            fields["report_url_reason"] = "identificador canónico ausente o no válido"
+    elif report.get("error"):
+        fields["reason"] = report["error"]
+    return fields
 
 
 def _url_relationships(url):
@@ -965,7 +1349,8 @@ def _analizar_url_evidencia(url, domain_reports=None, domain_intelligence=None):
             "url": {"status": result.get("status", "desconocido"),
                     "malicious": result.get("malicious", 0),
                     "suspicious": result.get("suspicious", 0),
-                    "reputation": attributes.get("reputation", "desconocida")},
+                    "reputation": attributes.get("reputation", "desconocida"),
+                    **_vt_report_presentation(attributes, "url", attributes.get("_vt_gui_id"))},
             "domain": domain_report,
             "relationships": relationships.get("relationships", {}),
         },
@@ -1187,7 +1572,7 @@ def _analizar_archivo_bytes(data, name, vt_report=None, mime=None, macro_status=
                  "sha256": sha256, "scripts": script_status, "macros": macro_status,
                  "mime": mime or "desconocido", "extension_type": ext_type or "desconocido",
                  "vt_metadata": metadata},
-        "virustotal": {"hash": sha256, "report": "available" if evidence.get("report_available") else "unknown",
+        "virustotal": {"hash": sha256, **_vt_report_presentation(vt_report, "file", sha256),
                         "malicious": evidence.get("malicious", 0), "suspicious": evidence.get("suspicious", 0),
                         "first_seen": metadata.get("first_seen") if metadata.get("first_seen") != "desconocido" else metadata.get("first_submission_date", "desconocido"),
                         "names": metadata.get("names", [])},
@@ -1826,6 +2211,7 @@ def analizar_inteligencia_dominio(urls, domain_reports=None, domain_targets=None
         status = criterio_detecciones(vt)["status"]
         virustotal = {
             "status": status,
+            **_vt_report_presentation(vt, "domain", dominio),
             "malicious": stats.get("malicious", 0),
             "suspicious": stats.get("suspicious", 0),
             "reputation": vt.get("reputation", "desconocida"),
@@ -2652,6 +3038,14 @@ def analizar_eml(ruta, smtp_ip=None, mail_from=None, helo=None, trusted_receiver
         delegated_whois.extend(delegated_report.get("whois", []))
         delegated_crt.extend(delegated_report.get("crt_sh", []))
     attachment_reports = [item["evidence"].get("report", {}).get("file", {}) for item in attachments if isinstance(item.get("evidence"), dict)]
+    attachment_vt_reports = []
+    for item in attachments:
+        child = item.get("evidence", {}).get("report", {}).get("virustotal", {})
+        attachment_vt_reports.append({
+            "name": item.get("name"), "sha256": item.get("sha256"),
+            "status": child.get("report", "unknown"),
+            **{key: value for key, value in child.items() if key not in ("report", "hash")},
+        })
     authentication_report = {
         "SPF": effective_spf,
         "SPF_independent": independent_spf,
@@ -2673,10 +3067,9 @@ def analizar_eml(ruta, smtp_ip=None, mail_from=None, helo=None, trusted_receiver
                        "Return-Path": identity_domains.get("Return-Path", "desconocido"),
                        "status": "inconsistent" if mismatch_evidence else "consistent" if identity_domains.get("From") else "incomplete"},
         "origin": origin,
-        "virustotal": {"domains": shared_domain_intelligence.get("domains", []),
-                        "urls": url_reports, "files": [{"name": item.get("name"), "sha256": item.get("sha256"),
-                                                          "status": item.get("evidence", {}).get("report", {}).get("virustotal", {}).get("report", "unknown")}
-                                                         for item in attachments]},
+        "virustotal": {"scope": "Se consultan dominios, URLs extraídas y hashes de adjuntos; no el archivo EML completo",
+                        "domains": shared_domain_intelligence.get("domains", []),
+                        "urls": url_reports, "files": attachment_vt_reports},
         "urlscan": urlscan_reports,
         "file": attachment_reports,
     }
