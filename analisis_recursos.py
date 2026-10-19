@@ -14,11 +14,8 @@ import contextlib
 import io
 import threading
 import time
-import textwrap
-import tempfile
 from email import policy
 from email.parser import BytesParser
-from email.utils import parseaddr
 from email.utils import getaddresses
 from html.parser import HTMLParser
 from urllib.error import HTTPError, URLError
@@ -58,7 +55,7 @@ def cargar_configuracion_env(path=None):
 _CONFIG = {key: os.environ.get(key, "") for key in ("VT_API_KEY", "URLSCAN_API_KEY")}
 VT_API_KEY = _CONFIG["VT_API_KEY"]
 VT_BASE_URL = "https://www.virustotal.com/api/v3"
-MAX_URLS = 5  # Limita las consultas a VirusTotal
+MAX_URLS = 5  # Límite de URLs derivadas desde un EML
 MAX_DOMAIN_LOOKUPS = 5
 MAX_VT_REQUESTS = 4
 MAX_INTEL_BYTES = 2 * 1024 * 1024
@@ -72,7 +69,6 @@ _vt_lock = threading.Lock()
 _vt_request_times = []
 MAX_LOCAL_FILE_BYTES = 25 * 1024 * 1024
 MAX_DKIM_SIGNATURES = 10
-MAX_EML_URL_EVIDENCE = 5
 MAX_EML_ATTACHMENTS = 20
 MAX_EML_ATTACHMENT_BYTES = 25 * 1024 * 1024
 MAX_OOXML_MEMBER_BYTES = 2 * 1024 * 1024
@@ -130,17 +126,11 @@ def consultar_virustotal(url):
 
     endpoint = f"{VT_BASE_URL}/urls/{url_id}"
 
-    request = Request(
-        endpoint,
-        headers={
-            "x-apikey": VT_API_KEY,
-            "accept": "application/json"
-        }
-    )
-
     try:
-        with urlopen(request, timeout=15) as respuesta:
-            datos = json.load(respuesta)
+        datos = _provider_json(
+            endpoint,
+            {"x-apikey": VT_API_KEY, "accept": "application/json"},
+        )
 
         attributes = datos["data"]["attributes"]
         if not isinstance(attributes, dict) or not validar_informe_vt(attributes):
@@ -159,6 +149,8 @@ def consultar_virustotal(url):
 
         return _service_error("VirusTotal", f"Error HTTP {error.code}")
 
+    except _LocalResponseLimit:
+        return _service_error("VirusTotal", "Respuesta de VirusTotal excede el límite local")
     except (URLError, TimeoutError):
         return _service_error("VirusTotal", "Error de conexión con VirusTotal")
 
@@ -177,17 +169,17 @@ def consultar_virustotal_archivo(sha256):
 
 
 def _consultar_virustotal_archivo_con_cuota(sha256):
-    request = Request(
-        f"{VT_BASE_URL}/files/{sha256}",
-        headers={"x-apikey": VT_API_KEY, "accept": "application/json"},
-    )
     try:
-        with urlopen(request, timeout=15) as response:
-            data = json.load(response)
+        data = _provider_json(
+            f"{VT_BASE_URL}/files/{sha256}",
+            {"x-apikey": VT_API_KEY, "accept": "application/json"},
+        )
         attributes = data["data"]["attributes"]
         if not isinstance(attributes, dict) or not validar_informe_vt(attributes):
             return _service_error("VirusTotal", "Informe de VirusTotal incompleto o no válido")
         return attributes
+    except _LocalResponseLimit:
+        return _service_error("VirusTotal", "Respuesta de VirusTotal excede el límite local")
     except HTTPError as error:
         messages = {404: "Archivo sin informe disponible en VirusTotal", 401: "API key inválida o no autorizada", 403: "Acceso denegado por VirusTotal", 429: "Límite de consultas de la API alcanzado"}
         return {"error": messages.get(error.code, f"Error HTTP {error.code}")} if error.code == 404 else _service_error("VirusTotal", messages.get(error.code, f"Error HTTP {error.code}"))
@@ -288,22 +280,37 @@ def criterio_detecciones(report):
     return criterio("fail" if count else "pass", f"VirusTotal: {stats['malicious']} maliciosos, {stats['suspicious']} sospechosos; {len(report['last_analysis_results'])} motores; cero detecciones no basta por sí solo")
 
 
+def _community_reputation_check(report):
+    reputation = report.get("reputation")
+    numeric = isinstance(reputation, int) and not isinstance(reputation, bool)
+    state = "fail" if numeric and reputation < 0 else "pass" if numeric and reputation > 0 else "unknown"
+    return criterio(state, f"reputación VT={reputation if numeric else 'desconocida'}")
+
+
 def evaluar_dominio(domain, report, registry):
+    report = report if isinstance(report, dict) else {}
+    registry = registry if isinstance(registry, dict) else {}
     detection = criterio_detecciones(report)
     reputation = report.get("reputation")
-    healthy = isinstance(reputation, int) and not isinstance(reputation, bool) and reputation > 0
+    positive_reputation = isinstance(reputation, int) and not isinstance(reputation, bool) and reputation > 0
     negative = isinstance(reputation, int) and not isinstance(reputation, bool) and reputation < 0
     age = None
     try:
-        created = datetime.fromisoformat(registry.get("registration_date", "").replace("Z", "+00:00"))
+        registration = registry.get("registration_date")
+        created = datetime.fromisoformat(registration.replace("Z", "+00:00")) if isinstance(registration, str) else None
+        if created is None:
+            raise ValueError("WHOIS registration date unavailable")
         created = created.replace(tzinfo=timezone.utc) if created.tzinfo is None else created.astimezone(timezone.utc)
         age = (datetime.now(timezone.utc) - created).days
         if age < 0:
             age = None
     except (ValueError, TypeError, AttributeError):
         pass
-    state = "fail" if detection["status"] == "fail" or negative or (age is not None and age < ESTABLISHED_DOMAIN_DAYS) else "pass" if detection["status"] == "pass" and healthy and age is not None else "unknown"
-    return criterio(state, f"Dominio {domain}: creación WHOIS={registry.get('registration_date', 'desconocida')}; antigüedad={age if age is not None else 'desconocida'} días (establecido >= {ESTABLISHED_DOMAIN_DAYS}); reputación VT={reputation if reputation is not None else 'desconocida'}; {detection['evidence']}")
+    age_ok = age is not None and age >= ESTABLISHED_DOMAIN_DAYS
+    state = "fail" if detection["status"] == "fail" or negative else "pass" if detection["status"] == "pass" and age_ok and positive_reputation else "unknown"
+    age_detail = f"{age} días" if age is not None else "desconocida"
+    reputation_detail = reputation if isinstance(reputation, int) and not isinstance(reputation, bool) else "desconocida"
+    return criterio(state, f"Dominio {domain}: {detection['evidence']}; requisitos de legitimidad verificada: informe VT válido sin detecciones, WHOIS con registro de al menos {ESTABLISHED_DOMAIN_DAYS} días (registro={registry.get('registration_date') or 'desconocido'}, antigüedad={age_detail}) y reputación comunitaria VT entera positiva (valor={reputation_detail}); reputación negativa sí es alerta")
 
 
 def evaluar_comportamiento_url(url, attributes, scan):
@@ -318,9 +325,10 @@ def evaluar_comportamiento_url(url, attributes, scan):
     vt_phishing = validar_informe_vt(attributes) and any(item.get("category") == "malicious" and re.search("phish", str(item.get("result", "")), re.I) for item in attributes["last_analysis_results"].values())
     scan_targets = list(scan.get("redirects", []))
     scan_targets.append(scan.get("final_url"))
-    external = any(isinstance(target, str) and extraer_dominio(target) not in (None, source) for target in scan_targets)
+    scan_external = any(isinstance(target, str) and extraer_dominio(target) not in (None, source) for target in scan_targets)
+    external = vt_external or scan_external
     credential = scan.get("credentials", "unknown")
-    confirmed = bool(vt_phishing and vt_external) or bool(scan.get("malicious") is True and scan.get("phishing") is True and credential == "password_input" and external)
+    confirmed = bool(vt_phishing and vt_external) or bool(scan.get("malicious") is True and scan.get("phishing") is True and credential == "password_input" and scan_external)
     risk = confirmed or scan.get("malicious") is True or scan.get("phishing") is True
     observed = bool(scan.get("behavior_observed") and scan.get("uuid") and not scan.get("reason"))
     normal = bool(observed and scan.get("malicious") is False and scan.get("phishing") is False and credential == "not_observed" and not external and extraer_dominio(scan.get("final_url", "")) == source)
@@ -353,20 +361,32 @@ def evaluar_evidencia(evidencia):
         if resource.get("confirmed_phishing"):
             return "Infectado", reasons + ["phishing corroborado por señal maliciosa y redirección/credenciales observadas"]
     high_phishing = any(resource.get("high_phishing_risk") for resource in resources)
-    if detections or high_phishing or evidencia.get("auth_failure") or evidencia.get("mixed"):
+    checks = evidencia.get("criteria", {})
+    optional = evidencia.get("optional_criteria", {})
+    failed = [check["evidence"] for check in list(checks.values()) + list(optional.values())
+              if check.get("status") == "fail"]
+    if detections or high_phishing or evidencia.get("auth_failure") or evidencia.get("mixed") or failed:
         if evidencia.get("auth_failure"):
             reasons.append("fallo de autenticación/alineación")
-        return "Sospechoso", reasons or ["señales mixtas"]
-    checks = evidencia.get("criteria", {})
+        return "Sospechoso", reasons + failed or ["señales mixtas"]
+    kind = evidencia.get("resource_type")
+    if kind == "eml" and evidencia.get("local_inspection", {}).get("status") != "pass":
+        return "No concluyente", ["inspección local incompleta; no hay evidencia afirmativa de riesgo suficiente para un veredicto de amenaza"]
     required = ("authentication", "domain", "detections", "behavior")
-    if all(key in checks and checks[key].get("status") in ("pass", "na") for key in required) and all(checks[key].get("status") == "pass" for key in ("detections", "behavior")):
-        kind = evidencia.get("resource_type")
-        if kind in ("eml", "url") and checks["domain"]["status"] != "pass":
-            return "Sospechoso", ["dominio sin evidencia positiva suficiente"]
-        if kind == "eml" and checks["authentication"]["status"] != "pass":
-            return "Sospechoso", ["autenticación del EML no verificada y alineada"]
-        return "Legítimo", ["todos los criterios obligatorios aplicables corroborados; no es garantía de seguridad"]
-    return "Sospechoso", ["evidencia insuficiente para confirmar legitimidad"]
+    primary_positive = all(key in checks and checks[key].get("status") in ("pass", "na") for key in required)
+    primary_positive = primary_positive and checks["detections"]["status"] == "pass"
+    if kind in ("eml", "url"):
+        primary_positive = primary_positive and checks.get("domain", {}).get("status") == "pass"
+    if kind == "eml":
+        primary_positive = primary_positive and checks.get("authentication", {}).get("status") == "pass"
+    if kind in ("eml", "file"):
+        primary_positive = primary_positive and checks.get("behavior", {}).get("status") == "pass"
+    if primary_positive and kind in ("eml", "url", "file"):
+        return "Legítimo", ["evidencia primaria aplicable corroborada"]
+    if (kind == "eml" and checks.get("behavior", {}).get("status") == "pass"
+            and all(checks.get(key, {}).get("status") in ("pass", "unknown") for key in required)):
+        return "Legítimo aparente — análisis estático", ["contenido local completamente inspeccionado dentro del alcance estático compatible, sin alertas observadas; falta corroborar evidencia primaria y no confirma autenticidad ni ausencia de amenazas"]
+    return "No concluyente", ["evidencia insuficiente para confirmar legitimidad; falta de evidencia no es una amenaza observada"]
 
 
 class _LocalResponseLimit(ValueError):
@@ -394,48 +414,70 @@ class _AuthResult(tuple):
         return result
 
 
+def _compact_report_value(value, limit=220):
+    """Render report values without turning provider data into a narrative."""
+    if isinstance(value, dict):
+        pieces = []
+        for key, item in value.items():
+            if isinstance(item, (dict, list, tuple)):
+                item = json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            pieces.append(f"{key}={item}")
+        value = "; ".join(pieces)
+    elif isinstance(value, (list, tuple, set)):
+        value = json.dumps(list(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    safe = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(value))
+    safe = re.sub(r"\s+", " ", safe).strip()
+    return safe[:limit] or "desconocido"
+
+
+def _print_report_section(label, value):
+    if value is None:
+        return
+    print(f"{label}: {_compact_report_value(value)}")
+
+
 def imprimir_veredicto(evidencia):
-    verdict, reasons = evaluar_evidencia(evidencia)
-    def line(value, prefix="", continuation="  "):
-        safe = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(value))
-        print(textwrap.fill(safe, width=88, initial_indent=prefix,
-                            subsequent_indent=continuation))
-    print("\n" + "=" * 72)
-    print(f"VEREDICTO FINAL: {verdict}")
-    print("=" * 72)
-    print("Por qué:")
-    for reason in dict.fromkeys(reasons + evidencia.get("concrete_causes", [])):
-        line(reason, "  - ", "    ")
-    print("\nCriterios del análisis:")
-    labels = {"authentication": "Autenticación", "domain": "Dominio",
-              "detections": "Detecciones", "behavior": "Comportamiento"}
-    states = {"pass": "Favorable", "fail": "Alerta", "unknown": "No verificado", "na": "No aplica"}
-    for name, label in labels.items():
-        check = evidencia.get("criteria", {}).get(name, criterio("unknown", "evidencia insuficiente"))
-        print(f"  {label}: {states.get(check['status'], 'No verificado')}")
-        for detail in dict.fromkeys(str(check["evidence"]).split("; ")):
-            line(detail, "    - ", "      ")
-    issues = {(item["service"], item["reason"]) for item in evidencia.get("service_issues", [])}
+    """Print only deterministic evidence fields and the established verdict."""
+    verdict, _ = evaluar_evidencia(evidencia)
+    print(f"VEREDICTO: {verdict}")
+    report = evidencia.get("report", {}) if isinstance(evidencia, dict) else {}
+    sections = (
+        ("AUTENTICACION", "authentication"),
+        ("IDENTIDADES", "identities"),
+        ("ORIGEN", "origin"),
+        ("VIRUSTOTAL", "virustotal"),
+        ("URLSCAN", "urlscan"),
+        ("WHOIS", "whois"),
+        ("CRT.SH", "crt_sh"),
+        ("ARCHIVO", "file"),
+    )
+    for label, key in sections:
+        _print_report_section(label, report.get(key))
+    criteria = evidencia.get("criteria", {}) if isinstance(evidencia, dict) else {}
+    if criteria:
+        statuses = "; ".join(f"{key}={value.get('status', 'unknown')}"
+                             for key, value in criteria.items() if isinstance(value, dict))
+        _print_report_section("CRITERIOS", statuses)
+    issues = []
+    for item in evidencia.get("service_issues", []) if isinstance(evidencia, dict) else []:
+        if isinstance(item, dict) and item.get("service") and item.get("reason"):
+            issues.append((str(item["service"]), str(item["reason"])))
     if issues:
-        print("\nDatos externos no disponibles:")
-        for service, reason in sorted(issues):
-            line(f"{service}: {reason}", "  - ", "    ")
-    print()
-    line(f"Umbrales: {MALICIOUS_CONSENSUS_THRESHOLD} motores maliciosos coincidentes en un mismo recurso; dominio establecido desde {ESTABLISHED_DOMAIN_DAYS} días. Un formulario o un hash conocido no confirman infección.")
+        _print_report_section("ESTADO", {service: reason for service, reason in sorted(set(issues))})
+    alerts = [str(item) for item in evidencia.get("concrete_causes", []) if item]
+    if alerts:
+        _print_report_section("ALERTAS", list(dict.fromkeys(alerts))[:4])
     return verdict
 
 
 def resumen_vt(attributes):
     if "error" in attributes:
-        print(f"VirusTotal: {attributes['error']} (análisis no disponible; no equivale a cero detecciones)")
         return {"report_available": False, "malicious": 0, "suspicious": 0}
     if not validar_informe_vt(attributes):
-        print("VirusTotal: informe incompleto o no válido; detecciones no verificables")
         return {"report_available": False, "malicious": 0, "suspicious": 0}
     stats = attributes["last_analysis_stats"]
     malicious = stats.get("malicious", 0)
     suspicious = stats.get("suspicious", 0)
-    print(f"VirusTotal: {malicious} maliciosos; {suspicious} sospechosos")
     causes = [f"VirusTotal motor {engine}: {item.get('category')} ({str(item.get('result', 'sin detalle'))[:160]})"
               for engine, item in attributes['last_analysis_results'].items()
               if item.get('category') in ('malicious', 'suspicious')]
@@ -443,46 +485,39 @@ def resumen_vt(attributes):
             "concrete_causes": causes}
 
 
-def _print_urlscan(scan):
-    print(f"URLscan privado: {scan.get('reason', scan.get('status', 'no evaluado'))}")
-    if not scan.get("screenshot"):
-        return
-    print(f"URLscan UUID: {scan['uuid']}; captura para revisión MANUAL: {scan['screenshot']} (no inspeccionada automáticamente)")
-    print(f"URL final: {scan.get('final_url', 'desconocida')}; IP: {scan.get('ip', 'desconocida')}; país: {scan.get('country', 'desconocido')}; dominios contactados: {', '.join(scan.get('domains', []))}")
-    print(f"Redirecciones observadas: {', '.join(scan.get('redirects', [])) or 'sin datos observados'}")
-    credential = scan.get("credentials", "unknown")
-    if credential == "password_input":
-        print("Solicitud de credenciales: campo password observado en DOM urlscan; no confirma phishing ni envío de datos")
-    elif credential == "not_observed":
-        print("Solicitud de credenciales: no se observaron campos password en DOM estático; no excluye formularios dinámicos")
-    else:
-        print("Solicitud de credenciales: no evaluada automáticamente (captura para revisión manual)")
-
-
 def _url_relationships(url):
     identifier = base64.urlsafe_b64encode(url.encode()).decode().rstrip('=')
-    gaps = []
+    result = {"relationships": {}, "service_issues": []}
     for relation in ("last_serving_ip_address",):
         related = _relacion_vt("urls", identifier, relation)
-        print(f"VirusTotal URL {relation}: {', '.join(related.get('names', [])) or related.get('error', 'sin relaciones observadas')}")
+        result["relationships"][relation] = related.get("names", [])
         if related.get("error"):
-            gaps.extend(_service_issues(related))
-    return gaps
+            result["service_issues"].extend(_service_issues(related))
+    return result
 
 
-def analizar_url(url):
+def _analizar_url_evidencia(url, domain_reports=None):
     _vt_cache.clear()
     if not validar_url(url):
         raise ValueError("Se requiere una URL HTTP(S) con dominio válido")
     if url_contiene_secretos(url):
-        print("Consulta remota omitida: URL con credenciales, fragmento o consulta.")
-        return imprimir_veredicto({"report_available": False, "criteria": {"behavior": criterio("unknown", "análisis remoto omitido por privacidad")}})
+        return {
+            "resource_type": "url",
+            "criteria": {"authentication": criterio("na", "URL"),
+                         "domain": criterio("unknown", "URL omitida por privacidad"),
+                         "detections": criterio("unknown", "URL omitida por privacidad"),
+                         "behavior": criterio("unknown", "URL omitida por privacidad")},
+            "optional_criteria": {}, "resources": [], "service_issues": [],
+            "concrete_causes": [], "mixed": False,
+            "report": {"virustotal": {"url": "omitida"}},
+        }
     result = analizar_reputacion(url)
     attributes = result["_report"]
-    domain_result = analizar_inteligencia_dominio([url])
+    domain_result = analizar_inteligencia_dominio([url], domain_reports=domain_reports)
     domain_result = domain_result if isinstance(domain_result, dict) else {}
     result["service_issues"] = list(_service_issues(domain_result))
-    result["service_issues"].extend(_url_relationships(url))
+    relationships = _url_relationships(url)
+    result["service_issues"].extend(relationships.get("service_issues", []))
     result.setdefault("concrete_causes", []).extend(domain_result.get("concrete_causes", []))
     result["mixed"] = domain_result.get("mixed", False)
     result["resources"] = domain_result.get("resources", [])
@@ -495,28 +530,49 @@ def analizar_url(url):
     result["high_phishing_risk"] = behavior["high_phishing_risk"]
     result.setdefault("concrete_causes", []).extend(behavior["concrete_causes"])
     result["criteria"] = {"authentication": criterio("na", "URL, no correo"),
-                          "domain": combinar_criterios(domain_result.get("criteria", []), empty="unknown"),
-                          "detections": criterio_detecciones(attributes), "behavior": behavior["behavior_check"]}
-    return imprimir_veredicto(result)
+                           "domain": combinar_criterios(domain_result.get("criteria", []), empty="unknown"),
+                           "detections": criterio_detecciones(attributes),
+                           "behavior": criterio("na", "URL sin contenido local")}
+    result["optional_criteria"] = {"remote_behavior": behavior["behavior_check"],
+                                    "community_reputation": _community_reputation_check(attributes)}
+    domain_entries = domain_result.get("domains", [])
+    whois = [entry.get("whois", {}) for entry in domain_entries]
+    crt = [entry.get("crt_sh", {}) for entry in domain_entries]
+    domain_report = domain_entries[0].get("virustotal", {}) if domain_entries else {}
+    result["report"] = {
+        "virustotal": {
+            "url": {"status": result.get("status", "desconocido"),
+                    "malicious": result.get("malicious", 0),
+                    "suspicious": result.get("suspicious", 0),
+                    "reputation": attributes.get("reputation", "desconocida")},
+            "domain": domain_report,
+            "relationships": relationships.get("relationships", {}),
+        },
+        "urlscan": behavior.get("scan", {"status": "unknown"}),
+        "whois": whois,
+        "crt_sh": crt,
+    }
+    return result
+
+
+def analizar_url(url, emitir=None, domain_reports=None):
+    if emitir is None:
+        emitir = _EML_DOMAIN_REPORTS is None
+    if domain_reports is None and _EML_DOMAIN_REPORTS is not None:
+        domain_reports = _EML_DOMAIN_REPORTS
+    evidence = _analizar_url_evidencia(url, domain_reports=domain_reports)
+    return imprimir_veredicto(evidence) if emitir else evidence
 
 
 def analizar_comportamiento_remoto_url(url, report):
     """Share remote-only behavior reporting for standalone and extracted URLs."""
-    for field, label in (("redirection_chain", "redirecciones"), ("last_final_url", "URL final"), ("outgoing_links", "enlaces salientes")):
-        value = report.get(field)
-        values = value if isinstance(value, list) else [value]
-        targets = [item.get("url") if isinstance(item, dict) else item for item in values[:20]]
-        safe_targets = [_redact_display_url(item) for item in targets if isinstance(item, str) and validar_url(item)]
-        if safe_targets:
-            print(f"VirusTotal {label}: {', '.join(safe_targets)} (informe existente)")
     scan = {}
     enabled = bool(_urlscan_key())
     if enabled:
-        print("ADVERTENCIA: urlscan.io recibe la URL para navegarla remotamente en un escaneo privado; no se visita ni resuelve el destino localmente. El filtro local es solo de mejor esfuerzo; urlscan gobierna la resolución y redirecciones remotas.")
         scan = consultar_urlscan_privado(url)
-        _print_urlscan(scan)
     behavior = evaluar_comportamiento_url(url, report, scan)
     behavior["service_issues"] = _service_issues(scan)
+    behavior["scan"] = scan if scan else {"status": "unknown", "reason": "URLscan API key ausente"}
     if not enabled:
         behavior["behavior_check"]["evidence"] = "urlscan sin API key configurada; comportamiento remoto no verificado. " + behavior["behavior_check"]["evidence"]
     elif scan.get("reason"):
@@ -665,10 +721,57 @@ class ExtractorCredenciales(HTMLParser):
             self.password_input = True
 
 
-def analizar_archivo(ruta):
-    print("Análisis de archivos SOLO ESTÁTICO: lectura binaria, SHA-256 y reputación por hash; nunca se ejecuta el archivo.")
+def _analizar_archivo_bytes(data, name, vt_report=None, mime=None, macro_status=None,
+                            sha256=None, size=None):
+    """Build file evidence from bounded bytes; never writes or executes the payload."""
+    if not isinstance(data, bytes):
+        raise TypeError("el contenido debe ser bytes")
+    size = len(data) if size is None else size
+    bounded = data[:MAX_LOCAL_FILE_BYTES]
+    detected, basis = detectar_tipo(bounded[:8192])
+    script_status = analizar_scripts_embebidos(bounded, detected)
+    macro_status = macro_status or analizar_macros_bytes(bounded, detected)
+    sha256 = hashlib.sha256(data).hexdigest() if sha256 is None else sha256
+    ext_type = tipo_por_extension(os.path.splitext(name)[1])
+    vt_report = vt_report if isinstance(vt_report, dict) else consultar_virustotal_archivo(sha256)
+    evidence = resumen_vt(vt_report)
+    evidence.update({
+        "resource_type": "file", "sha256": sha256, "name": os.path.basename(name)[:120],
+        "size": size, "type": detected, "type_basis": basis,
+        "extension_type": ext_type or "desconocido",
+        "scripts": script_status, "macros": macro_status,
+        "mime": mime or "desconocido", "executable": detected in ("PE", "ELF", "Mach-O", "script"),
+        "service_issues": list(_service_issues(vt_report)),
+    })
+    evidence["criteria"] = {
+        "authentication": criterio("na", "archivo"),
+        "domain": criterio("na", "archivo"),
+        "detections": criterio_detecciones(vt_report),
+        "behavior": evaluar_comportamiento_archivo(detected, script_status, macro_status, size),
+    }
+    evidence["optional_criteria"] = {"community_reputation": _community_reputation_check(vt_report)}
+    evidence["concrete_causes"] = list(evidence.get("concrete_causes", []))
+    if evidence["criteria"]["behavior"]["status"] == "fail":
+        evidence["concrete_causes"].append(f"{evidence['name']}: contenido activo; macros={macro_status}; scripts={script_status}")
+    metadata = _metadatos_vt_archivo(vt_report) if evidence.get("report_available") else {}
+    evidence["vt_metadata"] = metadata
+    evidence["report"] = {
+        "file": {"name": evidence["name"], "size": size, "type": detected,
+                 "sha256": sha256, "scripts": script_status, "macros": macro_status,
+                 "mime": mime or "desconocido", "extension_type": ext_type or "desconocido",
+                 "vt_metadata": metadata},
+        "virustotal": {"hash": sha256, "report": "available" if evidence.get("report_available") else "unknown",
+                        "malicious": evidence.get("malicious", 0), "suspicious": evidence.get("suspicious", 0),
+                        "first_seen": metadata.get("first_seen") if metadata.get("first_seen") != "desconocido" else metadata.get("first_submission_date", "desconocido"),
+                        "names": metadata.get("names", [])},
+    }
+    return evidence
+
+
+def analizar_archivo(ruta, emitir=True):
     digest = hashlib.sha256()
-    prefix = bytearray()
+    chunks = []
+    collected = 0
     with abrir_archivo_seguro(ruta) as stream:
         initial = os.fstat(stream.fileno())
         remaining = initial.st_size
@@ -677,51 +780,24 @@ def analizar_archivo(ruta):
             if not chunk:
                 raise OSError("El archivo cambió durante la lectura (fin prematuro)")
             digest.update(chunk)
-            if len(prefix) < 8192:
-                prefix.extend(chunk[:8192 - len(prefix)])
+            if collected < MAX_LOCAL_FILE_BYTES:
+                piece = chunk[:MAX_LOCAL_FILE_BYTES - collected]
+                chunks.append(piece)
+                collected += len(piece)
             remaining -= len(chunk)
         final = os.fstat(stream.fileno())
         if (final.st_size, final.st_mtime_ns, final.st_ctime_ns) != (initial.st_size, initial.st_mtime_ns, initial.st_ctime_ns):
             raise OSError("El archivo cambió durante la lectura")
-    sha256 = digest.hexdigest()
-    print(f"Tamaño real: {initial.st_size} bytes")
-    print(f"Nombre local: {os.path.basename(os.fspath(ruta))}")
-    print(f"SHA-256: {sha256}")
-    detected, basis = detectar_tipo(bytes(prefix))
-    print(f"Tipo detectado: {detected} ({basis})")
-    ext_type = tipo_por_extension(os.path.splitext(os.fspath(ruta))[1])
-    mismatch = bool(ext_type and detected != "desconocido" and ext_type != detected)
-    if mismatch:
-        print(f"ADVERTENCIA: extensión incompatible con el tipo detectado ({ext_type} vs {detected})")
-    with abrir_archivo_seguro(ruta) as script_stream:
-        script_bytes = script_stream.read(MAX_LOCAL_FILE_BYTES + 1)
-    script_status = analizar_scripts_embebidos(script_bytes[:MAX_LOCAL_FILE_BYTES], detected)
-    print(f"Análisis de scripts embebidos: {script_status}")
-    if detected == "ZIP/OOXML" and initial.st_size <= MAX_LOCAL_FILE_BYTES:
-        with abrir_archivo_seguro(ruta) as archive_stream:
-            archive_bytes = archive_stream.read(MAX_LOCAL_FILE_BYTES + 1)
-        if len(archive_bytes) <= MAX_LOCAL_FILE_BYTES:
-            print(f"Marcadores OOXML VBA: {'presentes' if indicadores_ooxml(archive_bytes) else 'no observados en miembros acotados'} (no exhaustivo)")
-        else:
-            print("Marcadores OOXML VBA: no evaluado (límite de lectura)")
+    data = b"".join(chunks)
+    if initial.st_size > MAX_LOCAL_FILE_BYTES:
+        data = data[:MAX_LOCAL_FILE_BYTES]
+    detected, _ = detectar_tipo(data[:8192])
     macro_status = analizar_macros_local(ruta, initial.st_size, detected)
-    print(f"Análisis estático de macros: {macro_status}")
-    vt_report = consultar_virustotal_archivo(sha256)
-    evidence = resumen_vt(vt_report)
-    evidence["service_issues"] = _service_issues(vt_report)
-    evidence.setdefault("concrete_causes", []).append(f"Archivo SHA-256 {sha256}; tipo {detected}; {script_status}; macros: {macro_status}")
-    if evidence.get("report_available"):
-        print_metadatos_vt_archivo(vt_report)
-    evidence["resource_type"] = "file"
-    evidence["executable"] = detected in ("PE", "ELF", "Mach-O", "script")
-    evidence["criteria"] = {"authentication": criterio("na", "archivo, no correo"),
-                            "domain": criterio("na", "archivo local, no dominio"),
-                            "detections": criterio_detecciones(vt_report),
-                            "behavior": evaluar_comportamiento_archivo(detected, script_status, macro_status, initial.st_size)}
-    if mismatch:
-        evidence["mixed"] = True
-        evidence.setdefault("concrete_causes", []).append("extensión incompatible con firmas del contenido")
-    return imprimir_veredicto(evidence)
+    evidence = _analizar_archivo_bytes(
+        data, os.fspath(ruta), macro_status=macro_status,
+        sha256=digest.hexdigest(), size=initial.st_size,
+    )
+    return imprimir_veredicto(evidence) if emitir else evidence
 
 
 def detectar_tipo(data):
@@ -729,7 +805,7 @@ def detectar_tipo(data):
     if data.startswith(b"\x7fELF"): return "ELF", "firma ELF"
     if data[:4] in (b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe"): return "Mach-O", "firma binaria"
     if data.startswith(b"%PDF-"): return "PDF", "firma PDF"
-    if data.startswith(b"PK\x03\x04"): return "ZIP/OOXML", "firma ZIP; contenido OOXML no garantizado"
+    if data.startswith(b"PK\x03\x04"): return "ZIP/OOXML", "firma ZIP; contenido OOXML no confirmado"
     if data.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"): return "OLE", "firma OLE"
     if data.startswith(b"#!"): return "script", "shebang"
     try:
@@ -767,13 +843,13 @@ def analizar_scripts_embebidos(data, detected):
                         observed = observed or b"<script" in member.lower()
         except (OSError, ValueError, zipfile.BadZipFile, RuntimeError, zlib.error):
             return "no evaluado (ZIP cifrado, corrupto o truncado)"
-    return ("marcadores de scripts embebidos presentes" if observed else "scripts embebidos no observados") + " (inspección estática acotada, no exhaustiva; no ejecuta contenido)"
+    return "scripts embebidos presentes" if observed else "scripts embebidos no observados"
 
 
 def evaluar_comportamiento_archivo(detected, scripts, macros, size):
     if detected == "desconocido" or size > MAX_LOCAL_FILE_BYTES or scripts.startswith("no evaluado"):
         return criterio("unknown", f"tipo={detected}; {scripts}; lectura de contenido acotada")
-    if "presentes" in scripts or "macros VBA detectadas;" in macros:
+    if "presentes" in scripts or "macros VBA detectadas" in macros:
         return criterio("fail", f"contenido activo observado; {scripts}; {macros}; no confirma ejecución ni payload")
     if detected in ("OLE", "ZIP/OOXML") and macros.startswith("no evaluado"):
         return criterio("unknown", f"macros Office no evaluadas: {macros}")
@@ -806,6 +882,27 @@ def analizar_macros_local(path, size, detected):
         return "no evaluado (archivo ZIP cifrado, corrupto o fuera de límites)"
     except Exception:
         return "no evaluado (error, archivo cifrado o formato no compatible)"
+
+
+def analizar_macros_bytes(data, detected):
+    """Detect Office macro markers in attachment bytes without creating a file."""
+    if detected not in ("OLE", "ZIP/OOXML"):
+        return "no aplica (no Office)"
+    if len(data) > MAX_LOCAL_FILE_BYTES:
+        return "no evaluado (límite de lectura)"
+    lowered = data.lower()
+    if detected == "ZIP/OOXML":
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                entries = archive.infolist()[:MAX_MACRO_ZIP_ENTRIES]
+                if any("vbaproject.bin" in info.filename.lower() for info in entries):
+                    return "macros VBA detectadas (vbaProject.bin)"
+        except (OSError, ValueError, zipfile.BadZipFile, RuntimeError, zlib.error):
+            return "no evaluado (ZIP cifrado, corrupto o truncado)"
+        return "sin macros VBA detectadas"
+    if any(marker in lowered for marker in (b"vba", b"_vba_project", b"vba_project")):
+        return "posibles macros VBA detectadas por marcadores OLE"
+    return "sin macros VBA detectadas"
 
 
 def _validar_metadatos_zip_macros(path):
@@ -868,8 +965,10 @@ def indicadores_ooxml(data):
     return False
 
 
-def print_metadatos_vt_archivo(attributes):
-    if not validar_informe_vt(attributes): return
+def _metadatos_vt_archivo(attributes):
+    metadata = {}
+    if not validar_informe_vt(attributes):
+        return metadata
     def clean_text(value, limit=160):
         if not isinstance(value, str):
             return "desconocido"
@@ -896,9 +995,10 @@ def print_metadatos_vt_archivo(attributes):
             value = clean_text(value)
         elif key == "size" and (isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 2**63 - 1):
             value = "desconocido"
-        print(f"VirusTotal {key}: {value if value not in (None, '') else 'desconocido'} (fuente: VirusTotal)")
+        return value if value not in (None, '') else "desconocido"
     for key in ("type_description", "type_tag", "size", "names", "first_submission_date", "first_seen", "last_analysis_date"):
-        display(key)
+        metadata[key] = display(key)
+    return metadata
 
 
 def decodificar_candidatos(text):
@@ -942,50 +1042,35 @@ def decodificar_candidatos(text):
 
 
 def inventariar_adjuntos(correo):
-    print("Adjuntos: análisis SOLO ESTÁTICO; se leen bytes y metadatos, nunca se ejecutan.")
     entries, total = [], 0
     for part in correo.walk():
         if part.is_multipart() or (part.get_content_disposition() != "attachment" and not part.get_filename()):
             continue
         if len(entries) >= MAX_EML_ATTACHMENTS:
-            print("Adjuntos: inventario truncado por límite de cantidad."); break
+            break
         payload = part.get_payload(decode=True)
         if not isinstance(payload, bytes):
             entries.append({"name": "adjunto-sin-nombre", "status": "no evaluado (contenido no decodificable)"}); continue
         name = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(part.get_filename() or "adjunto-sin-nombre"))[:120]
         if total + len(payload) > MAX_EML_ATTACHMENT_BYTES:
-            entries.append({"name": name, "status": "no evaluado (límite total de bytes)"}); print("Adjuntos: inventario truncado por límite total de bytes."); break
+            entries.append({"name": name, "status": "no evaluado (límite total de bytes)"}); break
         total += len(payload)
-        detected, basis = detectar_tipo(payload[:8192])
-        sha256 = hashlib.sha256(payload).hexdigest()
-        script_status = analizar_scripts_embebidos(payload, detected)
-        macros = "no aplica (no Office)"
-        if detected in ("OLE", "ZIP/OOXML"):
-            with tempfile.TemporaryDirectory(prefix="triage-static-") as directory:
-                path = os.path.join(directory, "attachment.bin")
-                with open(path, "wb") as stream:
-                    stream.write(payload)
-                macros = analizar_macros_local(path, len(payload), detected)
-        print(f"Adjunto {name}: MIME={part.get_content_type()}, tamaño real={len(payload)} bytes, SHA-256={sha256}, tipo={detected} ({basis}); macros: {macros}; scripts embebidos: {script_status}")
-        entries.append({"name": name, "sha256": sha256, "status": "inventariado", "script_status": script_status,
-                        "macros": macros, "type": detected, "size": len(payload)})
+        evidence = _analizar_archivo_bytes(payload, name, mime=part.get_content_type())
+        entries.append({"name": name, "sha256": evidence["sha256"], "status": "inventariado",
+                        "script_status": evidence["scripts"], "macros": evidence["macros"],
+                        "type": evidence["type"], "size": len(payload), "evidence": evidence})
     return entries
 
 
 def analizar_reputacion(url):
     """Normalize one URL report; relationship queries are scheduled separately."""
-    print(f"URL: {_redact_display_url(url)}")
     report = consultar_virustotal(url)
     result = resumen_vt(report)
     result["_report"] = report
     if not result["report_available"]:
         return dict(result, status="desconocido")
-    print(f"VirusTotal URL: reputación={report.get('reputation', 'desconocida')}; estadísticas={report['last_analysis_stats']}")
-    print(f"Último análisis (VirusTotal): {report.get('last_analysis_date', 'desconocido')}")
-    for cause in result.get("concrete_causes", []):
-        print(cause)
     behavior = evaluar_comportamiento_url(url, report, {})
-    status = "malicioso" if result["malicious"] >= MALICIOUS_CONSENSUS_THRESHOLD or behavior["high_phishing_risk"] else "sospechoso" if result["malicious"] or result["suspicious"] else "sin_detecciones" if sum(report["last_analysis_stats"].values()) else "desconocido"
+    status = "malicioso" if result["malicious"] >= MALICIOUS_CONSENSUS_THRESHOLD or behavior["high_phishing_risk"] else "sospechoso" if result["malicious"] or result["suspicious"] else "sin_detecciones" if criterio_detecciones(report)["status"] == "pass" else "desconocido"
     return dict(result, status=status)
 
 
@@ -1131,6 +1216,7 @@ def _provider_json(url, headers=None):
 
 
 _vt_cache = {}
+_EML_DOMAIN_REPORTS = None
 
 
 def _take_vt_budget():
@@ -1159,7 +1245,7 @@ def urlopen(request, timeout=LOOKUP_TIMEOUT):
 
 
 def consultar_vt_objeto(collection, identifier):
-    if collection not in ("domains", "ip_addresses", "urls") or not VT_API_KEY:
+    if collection not in ("domains", "urls") or not VT_API_KEY:
         return {"error": "VirusTotal no disponible (API key ausente o tipo no válido)"}
     key = (collection, identifier)
     if key in _vt_cache:
@@ -1210,21 +1296,21 @@ def _relacion_vt(collection, identifier, relation):
 
 
 
-def analizar_inteligencia_dominio(urls):
-    evidence = {"service_issues": [], "concrete_causes": [], "mixed": False, "criteria": [], "resources": []}
+def analizar_inteligencia_dominio(urls, domain_reports=None):
+    evidence = {"service_issues": [], "concrete_causes": [], "mixed": False,
+                "criteria": [], "resources": [], "domains": []}
+    domain_reports = domain_reports if isinstance(domain_reports, dict) else {}
     dominios = sorted({dominio for url in urls if not url_contiene_secretos(url) and (dominio := extraer_dominio(url)) and _safe_domain(dominio)})[:MAX_DOMAIN_LOOKUPS]
-    print("\n========== INTELIGENCIA DE DOMINIOS (crt.sh + WHOIS) ==========")
     if not dominios:
-        print("No hay dominios HTTP(S) válidos para consultar.")
         return evidence
     for dominio in dominios:
-        print(f"\nDominio: {dominio}")
-        vt = consultar_vt_objeto("domains", dominio)
+        vt = domain_reports.get(dominio)
+        if not isinstance(vt, dict):
+            vt = consultar_vt_objeto("domains", dominio)
         stats = vt.get("last_analysis_stats", {}) if validar_informe_vt(vt) else {}
         if stats:
             evidence["resources"].append({"source": f"Dominio {dominio} (VirusTotal)",
                                           "malicious": stats["malicious"], "suspicious": stats["suspicious"], "report_available": True})
-        print(f"VirusTotal dominio: {stats.get('malicious', 'desconocido')} maliciosos; {stats.get('suspicious', 'desconocido')} sospechosos; reputación {vt.get('reputation', 'desconocida')} (fuente: VirusTotal)")
         if not stats:
             evidence["service_issues"].extend(_service_issues(vt))
         if stats.get("malicious", 0) or stats.get("suspicious", 0):
@@ -1232,20 +1318,25 @@ def analizar_inteligencia_dominio(urls):
             evidence["concrete_causes"].append(f"Dominio {dominio}: VirusTotal {stats['malicious']} maliciosos y {stats['suspicious']} sospechosos")
         certificados = consultar_crtsh(dominio)
         if "error" in certificados:
-            print(f"crt.sh: {certificados['error']}")
             evidence["service_issues"].extend(_service_issues(certificados))
-        else:
-            print(f"crt.sh: {certificados['count']} nombres de certificados; nombres: {', '.join(certificados['names']) or 'ninguno'}")
-            for cert in certificados.get("certificates", [])[:5]:
-                print(f"crt.sh certificado (fechas reportadas): inicio={cert.get('not_before', 'desconocido')}; fin={cert.get('not_after', 'desconocido')}; entrada CT={cert.get('entry_timestamp', 'desconocida')}")
         whois = consultar_whois(dominio)
         structured = whois
         evidence["criteria"].append(evaluar_dominio(dominio, vt, structured))
         if "error" in whois:
-            print(f"WHOIS: {whois['error']}")
             evidence["service_issues"].extend(_service_issues(whois))
-        else:
-            print(f"WHOIS: registro={structured.get('registration_date') or 'desconocido'}; registrador={structured.get('registrar') or 'desconocido'}; nameservers={', '.join(structured.get('nameservers', [])) or 'desconocidos'} (datos opcionales/redactados pueden no estar disponibles)")
+        evidence["domains"].append({
+            "domain": dominio,
+            "virustotal": {
+                "status": criterio_detecciones(vt)["status"],
+                "malicious": stats.get("malicious", "desconocido"),
+                "suspicious": stats.get("suspicious", "desconocido"),
+                "reputation": vt.get("reputation", "desconocida"),
+                "requirements": "VT_clean; WHOIS_age>=180d; reputation>0",
+            },
+            "whois": {key: whois.get(key) for key in ("registration_date", "registration_age_days", "registrar", "nameservers")}
+                     if isinstance(whois, dict) else {},
+            "crt_sh": certificados if isinstance(certificados, dict) else {},
+        })
     return evidence
 
 
@@ -1518,7 +1609,8 @@ def extraer_contexto_smtp(correo, trusted_receiver=None):
     result.update(sources={}, warnings=[], trusted=False)
     warnings = result["warnings"]
     hops = []
-    for index, header in enumerate(correo.get_all("Received", [])[:100], 1):
+    received = list(correo.get_all("Received", [])[:100])
+    for index, header in reversed(list(enumerate(received, 1))):
         text = str(header)[:4096]
         match = re.search(r"\bfrom\s+(.*?)\s+by\s+([^\s;()]+)", text, re.I)
         if not match:
@@ -1543,8 +1635,8 @@ def extraer_contexto_smtp(correo, trusted_receiver=None):
         elif hops:
             warnings.append("frontera indicada ausente o ambigua en Received; no se elige otro salto")
     elif hops:
-        # The most recent hop is just a candidate, not proof of the original sender.
-        selected = hops[0]
+        # Received headers are prepended; the first valid candidate from the bottom is earliest.
+        selected = next((hop for hop in hops if hop.get("smtp_ip")), None)
     if selected:
         for key in ("smtp_ip", "helo", "receiver"):
             result[key] = selected[key]
@@ -1616,7 +1708,8 @@ def extraer_contexto_smtp(correo, trusted_receiver=None):
 
 def extraer_ip_received(headers, trusted_receiver=None):
     hops = []
-    for header in reversed(headers):
+    bounded_headers = list(headers)[:100]
+    for original_index, header in reversed(list(enumerate(bounded_headers, 1))):
         text = str(header)[:4096]
         candidates = []
         for token in re.findall(r"\[([^\]]+)\]|(?<![A-Za-z0-9:])((?:\d{1,3}\.){3}\d{1,3}|[0-9A-Fa-f:]{3,})", text):
@@ -1630,317 +1723,242 @@ def extraer_ip_received(headers, trusted_receiver=None):
             except ValueError:
                 continue
         boundary_claimed = bool(trusted_receiver and re.search(r"\bby\s+" + re.escape(trusted_receiver) + r"(?=\s|;|$)", text, re.I))
-        hops.append({"ips": candidates[:8], "trusted": False, "boundary_claimed": boundary_claimed})
+        hops.append({"ips": candidates[:8], "trusted": False, "boundary_claimed": boundary_claimed,
+                     "source": f"Received[{original_index}]"})
     return hops
 
 
-def analizar_eml(ruta, smtp_ip=None, mail_from=None, helo=None, trusted_receiver=None):
+def _email_identity_evidence(message):
+    """Compare single, well-formed domains without filtering malformed identities away."""
+    domains, causes, gaps = {}, [], []
+    for name in ("From", "Reply-To", "Return-Path"):
+        values = [value for field, value in message.raw_items() if field.lower() == name.lower()]
+        if not values:
+            if name == "From":
+                gaps.append("From ausente; identidad no inspeccionable")
+            continue
+        if name == "Return-Path" and len(values) == 1 and str(values[0]).strip() == "<>":
+            gaps.append("Return-Path nulo; dominio SMTP no comparable")
+            continue
+        try:
+            # The email parser rejects a DNS root dot; canonicalize only that valid domain spelling.
+            value = re.sub(r"\r?\n[ \t]+", " ", str(values[0]))
+            value = re.sub(r"(@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*)\.(?=[>\s,;]|$)", r"\1", value)
+            header = policy.default.header_factory("From", value)
+            addresses = header.addresses
+            domain = _normalizar_dominio(addresses[0].domain) if len(addresses) == 1 else ""
+            valid = (len(values) == 1 and len(addresses) == 1 and addresses[0].username
+                     and not header.defects and domain and extraer_dominio("https://" + domain) == domain
+                     and not any(group.display_name is not None for group in header.groups))
+            if name == "Return-Path":
+                valid = valid and re.fullmatch(r"<[^<>]+>", str(values[0]).strip())
+        except (ValueError, IndexError):
+            valid = False
+        if not valid:
+            causes.append(f"{name} presente pero malformado, múltiple o ambiguo (direcciones omitidas)")
+        else:
+            domains[name] = domain
+    for name in ("Reply-To", "Return-Path"):
+        if domains.get(name) and domains.get("From") and domains[name] != domains["From"]:
+            causes.append(f"Dominio {name} distinto de From")
+    return domains, causes, gaps
+
+
+def analizar_eml(ruta, smtp_ip=None, mail_from=None, helo=None, trusted_receiver=None, emitir=True):
+    """Analyze only requested EML evidence and delegate extracted resources."""
+    global _EML_DOMAIN_REPORTS
     _vt_cache.clear()
     with abrir_archivo_seguro(ruta) as archivo:
         contenido_eml = archivo.read(MAX_LOCAL_FILE_BYTES + 1)
     if len(contenido_eml) > MAX_LOCAL_FILE_BYTES:
         raise ValueError("El archivo supera el límite de 25 MiB durante la lectura")
-    with io.BytesIO(contenido_eml) as archivo:
-        correo = BytesParser(
-            policy=policy.default
-        ).parse(archivo)
+    correo = BytesParser(policy=policy.default).parse(io.BytesIO(contenido_eml))
 
     context = extraer_contexto_smtp(correo, trusted_receiver)
     supplied = {"smtp_ip": smtp_ip, "mail_from": mail_from, "helo": helo}
-    print("\n========== CONTEXTO SMTP EXTRAÍDO ==========")
     for key, value in supplied.items():
         if value is not None:
             context[key] = value
-            context["sources"][key] = "argumento manual (prioridad sobre EML)"
-    for key in ("smtp_ip", "mail_from", "helo", "receiver"):
-        print(f"{key}: {context[key] or 'no determinado'} — {context['sources'].get(key, 'sin fuente inequívoca')}")
-    for warning in context["warnings"]:
-        print(f"Contexto SMTP pendiente: {warning}")
-    print("Los valores extraídos son candidatos no confiables; receiver no configura --trusted-receiver ni prueba la IP de origen real.")
+            context["sources"][key] = "argumento"
     smtp_ip, mail_from, helo = (context[key] for key in ("smtp_ip", "mail_from", "helo"))
     smtp_context_available = all(value is not None for value in (smtp_ip, mail_from, helo))
-    if smtp_context_available:
-        source = "argumentos manuales" if all(value is not None for value in supplied.values()) else "valores extraídos del EML y/o argumentos manuales"
-        print(f"SPF se calcula con la tupla SMTP completa ({source}); los Received del EML no prueban por sí solos el origen histórico.")
-    else:
-        print("SPF no evaluable: faltan valores SMTP en el EML. Los campos ausentes quedan desconocidos; no se infieren desde From.")
 
-    print("\n========== INVENTARIO ESTÁTICO DE ADJUNTOS ==========")
-    attachments = inventariar_adjuntos(correo)
-
-    remitente = str(correo.get("From", "Desconocido"))
-    destinatario = str(correo.get("To", "Desconocido"))
-    asunto = str(correo.get("Subject", "Sin asunto"))
-
-    print("\n========== INFORMACIÓN DEL CORREO ==========")
-    print(f"Remitente: {remitente}")
-    print(f"Destinatario: {destinatario}")
-    print(f"Asunto: {asunto}")
-
-    alertas_auth = []
-    print("\n========== AUTENTICACIÓN (CABECERAS NO VERIFICADAS) ==========")
-    for header in correo.get_all("Authentication-Results", []):
-        claims = re.findall(r"\b(spf|dkim|dmarc)\s*=\s*([a-zA-Z]+)", str(header), re.I)
-        for protocol, status in claims:
-            print(f"Authentication-Results (afirmación NO verificada): {protocol.upper()}={status.upper()}")
-
+    identity_domains, mismatch_evidence, local_gaps = _email_identity_evidence(correo)
+    from_domain = identity_domains.get("From", "")
     dkim_results = verificar_dkim(contenido_eml)
-    from_addresses = _direcciones(correo.get_all("From", []))
-    from_domain = _normalizar_dominio(from_addresses[0].rsplit("@", 1)[1]) if len(from_addresses) == 1 else ""
-    for signature in dkim_results:
-        alignment = _alineado(signature.get("domain"), from_domain, False)
-        print(f"DKIM independiente: {signature['status'].upper()} d={signature.get('domain', 'no disponible')} s={signature.get('selector', 'no disponible')}; alineación From={'desconocida (PSL no disponible)' if alignment is None else 'sí' if alignment else 'no'}")
     spf_result = verificar_spf(smtp_ip, mail_from, helo)
-    print(f"SPF independiente: {spf_result[0].upper()} — {spf_result[1]}; {'tupla SMTP completa' if smtp_context_available else 'tupla SMTP incompleta'}")
-    spf_domain = _normalizar_dominio(mail_from.rsplit('@', 1)[1]) if mail_from and '@' in mail_from else ""
+    spf_domain = _normalizar_dominio(mail_from.rsplit("@", 1)[1]) if mail_from and "@" in mail_from else ""
     spf_alignment = _alineado(spf_domain, from_domain, False)
-    print(f"Alineación SPF/From: {'desconocida' if spf_alignment is None or not spf_domain else 'sí' if spf_alignment else 'no'} (comparación relajada; DNS actual no prueba estado histórico)")
-    # DMARC uses independently calculated SPF/DKIM results, never Authentication-Results claims.
     effective_spf = spf_result[0] if smtp_context_available else "unknown"
-    dmarc_result = verificar_dmarc(from_domain, dkim_results, (effective_spf, spf_result[1], _normalizar_dominio(mail_from.rsplit('@', 1)[1]) if mail_from and '@' in mail_from else ""))
-    print(f"DMARC independiente: {dmarc_result[0].upper()} — {dmarc_result[1]}")
-    if dmarc_result[0] == "fail":
-        alertas_auth.append("DMARC independiente: fallo de alineación verificada")
+    dmarc_result = verificar_dmarc(
+        from_domain, dkim_results,
+        (effective_spf, spf_result[1], spf_domain),
+    )
+    service_issues = list(_service_issues(spf_result)) + list(_service_issues(dmarc_result))
+    for signature in dkim_results:
+        service_issues.extend(_service_issues(signature))
 
-    print("\n========== ORIGEN DE TRANSPORTE (CABECERAS NO CONFIABLES) ==========")
-    print("Received se recorre de abajo hacia arriba; el primer candidato no prueba la IP de origen real. Se requieren registros SMTP confiables para confirmarla.")
     hops = extraer_ip_received(correo.get_all("Received", []), trusted_receiver)
-    for hop in hops[:20]:
-        label = "frontera receptora CLAIMED por coincidencia textual; IP candidata, no autenticada por el EML" if hop.get("boundary_claimed") else "candidato según cabecera no verificada"
-        print(f"Received: {', '.join(hop['ips']) or 'sin IP reconocible'} — {label}")
+    if trusted_receiver:
+        claimed = [hop for hop in hops if hop.get("boundary_claimed") and len(hop.get("ips", [])) == 1]
+        origin_hop = claimed[0] if len(claimed) == 1 else next((hop for hop in hops if len(hop.get("ips", [])) == 1), None)
+    else:
+        origin_hop = next((hop for hop in hops if len(hop.get("ips", [])) == 1), None)
+    origin = {
+        "ip": origin_hop["ips"][0] if origin_hop else "desconocida",
+        "header": origin_hop.get("source", "desconocida") if origin_hop else "desconocida",
+        "receiver": context.get("receiver") or "desconocido",
+        "status": "candidata-no-verificada" if origin_hop else "no-determinada",
+    }
 
-    # Comparación de dominios
-    print("\n========== ANÁLISIS DEL REMITENTE ==========")
-
-    from_addr = parseaddr(remitente)[1]
-    return_addresses = _direcciones(correo.get_all("Return-Path", []))
-    return_addr = return_addresses[0] if len(return_addresses) == 1 else ""
-    reply_addresses = _direcciones(correo.get_all("Reply-To", []))
-
-    dominio_from = (
-        from_addr.rsplit("@", 1)[1].lower()
-        if "@" in from_addr else ""
-    )
-    dominio_return = (
-        return_addr.rsplit("@", 1)[1].lower()
-        if "@" in return_addr else ""
-    )
-
-    print(f"Dominio From: {dominio_from or 'No disponible'}")
-    print(
-        f"Dominio Return-Path: "
-        f"{dominio_return or 'No disponible'}"
-    )
-
-    if dominio_from and dominio_return:
-        if dominio_from != dominio_return:
-            print(
-                "Observación: Los dominios son diferentes. "
-                "Esto no necesariamente indica phishing, "
-                "pero requiere revisar su alineación DMARC."
-            )
-        else:
-            print("Los dominios coinciden exactamente.")
-
-    mismatch_evidence = []
-    for label, addresses in (("Reply-To", reply_addresses), ("Return-Path", return_addresses)):
-        if addresses and (len(addresses) != 1 or len(from_addresses) != 1 or addresses[0] != from_addresses[0]):
-            mismatch_evidence.append(f"{label} no coincide con From")
-            print(f"Evidencia sospechosa: {label} difiere de From (direcciones omitidas). No confirma malware.")
-
-    # Extraer URLs
-    print("\n========== EXTRACCIÓN DE ENLACES ==========")
-    print("Decodificación estática Base64/URL con biblioteca estándar Python, sin procesos externos ni navegación; límites de bytes, candidatos y capas.")
-
+    attachments = inventariar_adjuntos(correo)
     urls = []
-    decode_gaps = []
-    unresolved_encoded = False
-    body_active = False
-    body_credentials = False
-
+    inspected_body_parts = 0
     for parte in correo.walk():
         tipo = parte.get_content_type()
-
+        for name in ("Content-Type", "Content-Disposition", "Content-Transfer-Encoding", "MIME-Version"):
+            if len(parte.get_all(name, [])) > 1:
+                local_gaps.append(f"cabecera MIME duplicada: {name}")
+        if str(parte.get("MIME-Version", "1.0")).strip() != "1.0":
+            local_gaps.append("versión MIME no cubierta")
+        if parte.get_content_disposition() == "attachment" or parte.get_filename():
+            local_gaps.append("adjunto con cobertura local parcial")
+        if parte.is_multipart():
+            if tipo not in ("multipart/mixed", "multipart/alternative", "multipart/related"):
+                local_gaps.append(f"contenedor MIME no cubierto: {tipo}")
+            continue
         if tipo not in ("text/plain", "text/html"):
+            local_gaps.append(f"parte MIME no inspeccionada: {tipo}")
             continue
-
+        encodings = parte.get_all("Content-Transfer-Encoding", [])
+        encoding = str(encodings[0]).strip().lower() if encodings else "7bit"
+        if len(encodings) > 1 or encoding not in ("7bit", "8bit", "binary", "base64", "quoted-printable"):
+            local_gaps.append(f"codificación MIME ambigua: {encoding}")
+        payload = parte.get_payload()
+        if encoding == "quoted-printable" and isinstance(payload, str) and re.search(r"=(?![0-9a-fA-F]{2}|\r?\n)", payload):
+            local_gaps.append("quoted-printable malformado")
         try:
-            contenido = parte.get_content()
-        except Exception:
+            contenido = parte.get_content(errors="strict")
+        except Exception as error:
+            local_gaps.append(f"texto no decodificable: {type(error).__name__}")
             continue
-
         if not isinstance(contenido, str):
+            local_gaps.append("parte de texto sin contenido")
             continue
-
-        urls.extend(
-            re.findall(
-                r'https?://[^\s<>"\']+',
-                contenido,
-                flags=re.IGNORECASE
-            )
-        )
+        decoded_payload = parte.get_payload(decode=True)
+        if encoding == "7bit" and isinstance(decoded_payload, bytes) and any(byte > 127 for byte in decoded_payload):
+            local_gaps.append("bytes no ASCII declarados como 7bit")
+        if contenido.strip():
+            inspected_body_parts += 1
+        if len(contenido.encode("utf-8")) > MAX_DECODE_BYTES:
+            local_gaps.append("límite de decodificación alcanzado")
+        urls.extend(re.findall(r'https?://[^\s<>"\']+', contenido, flags=re.IGNORECASE))
         decoded_urls = decodificar_candidatos(contenido)
-        encoded = bool(decoded_urls) or bool(re.search(r"[A-Za-z0-9+/]{40,}={0,2}", contenido))
-        body_active = body_active or bool(re.search(r"<script\b", contenido, re.I))
+        non_url_text = re.sub(r'https?://[^\s<>"\']+', "", contenido, flags=re.I)
+        encoded = bool(decoded_urls) or bool(re.search(r"[A-Za-z0-9+/_-]{20,}={0,2}", non_url_text)) or bool(re.search(r"%[0-9a-fA-F]{2}", contenido))
         if encoded:
-            print("Decodificación Base64/URL local aplicada; el contenido recuperado no se ejecuta.")
-            unresolved_encoded = unresolved_encoded or not decoded_urls
-            if not decoded_urls:
-                decode_gaps.append("contenido codificado sin URLs recuperables dentro de los límites; resultado estático no exhaustivo")
+            local_gaps.append("contenido codificado: recuperación acotada")
         urls.extend(decoded_urls)
-
         if tipo == "text/html":
             extractor = ExtractorEnlaces()
-            extractor.feed(contenido)
+            try:
+                extractor.feed(contenido)
+                extractor.close()
+            except (ValueError, AssertionError):
+                local_gaps.append("HTML no interpretable")
             urls.extend(extractor.urls)
-            credentials = ExtractorCredenciales()
-            credentials.feed(contenido)
-            body_credentials = body_credentials or credentials.password_input
 
+    if not inspected_body_parts:
+        local_gaps.append("sin cuerpo de texto inspeccionable")
+    for part in correo.walk():
+        defects = list(part.defects) + [defect for name, header in part.items()
+                                        if name.lower() not in ("from", "reply-to", "return-path")
+                                        for defect in getattr(header, "defects", ())]
+        if defects:
+            local_gaps.append("defectos MIME: " + ", ".join(sorted({type(defect).__name__ for defect in defects})))
     urls_limpias = []
-
     for url in urls:
         url = url.rstrip(".,;)")
         if url not in urls_limpias:
             urls_limpias.append(url)
 
-    print(f"URLs encontradas: {len(urls_limpias)}")
-
-    # VirusTotal
-    print("\n========== VIRUSTOTAL ==========")
-
-    resultados_vt = []
-    service_issues = list(_service_issues(spf_result)) + list(_service_issues(dmarc_result))
-    for signature in dkim_results:
-        service_issues.extend(_service_issues(signature))
-    if len(urls_limpias) > MAX_URLS:
-        print(
-            f"Se consultarán las primeras {MAX_URLS} URLs "
-            "para limitar el consumo de la API."
-        )
-
-    # Round-robin primary URL/hash reports before any optional VT relationships.
-    primary_urls = urls_limpias[:MAX_URLS]
-    primary_attachments = [item for item in attachments[:MAX_URLS] if "sha256" in item]
-    primary_url_reports, primary_hash_reports = {}, {}
-    for index in range(max(len(primary_urls), len(primary_attachments))):
-        if index < len(primary_urls):
-            primary_url = primary_urls[index]
-            if not url_contiene_secretos(primary_url):
-                primary_url_reports[primary_url] = analizar_reputacion(primary_url)
-        if index < len(primary_attachments):
-            attachment = primary_attachments[index]
-            sha256 = attachment["sha256"]
-            if sha256 not in primary_hash_reports:
-                primary_hash_reports[sha256] = consultar_virustotal_archivo(sha256)
-
-    scan_causes = []
-    url_resources, url_detection_checks, url_behavior_checks = [], [], []
-    for url in primary_urls:
-        if url_contiene_secretos(url):
-            print("URL omitida: contiene credenciales, fragmento o consulta; consulta remota no realizada.")
-            resultados_vt.append((url, "sospechoso", 0, 0))
-            url_detection_checks.append(criterio("unknown", "URL omitida por privacidad"))
-            url_behavior_checks.append(criterio("unknown", "URL sin análisis de comportamiento por privacidad"))
-            continue
-        estado = primary_url_reports[url]
-        resultados_vt.append((url, estado["status"], estado["malicious"], estado["suspicious"]))
-        if resultados_vt[-1][1] == "desconocido":
-            service_issues.extend(_service_issues(estado.get("_report", {})))
-        report = estado.get("_report", {})
-        behavior = analizar_comportamiento_remoto_url(url, report)
-        service_issues.extend(_service_issues(behavior))
-        scan_causes.extend(behavior["concrete_causes"])
-        url_detection_checks.append(criterio_detecciones(report))
-        url_behavior_checks.append(behavior["behavior_check"])
-        resource = dict(estado)
-        resource.update(confirmed_phishing=behavior["confirmed_phishing"], high_phishing_risk=behavior["high_phishing_risk"])
-        url_resources.append(resource)
-
-    if not urls_limpias:
-        print("No se encontraron URLs para consultar.")
-
     if from_domain and _safe_domain(from_domain):
         from_intel = consultar_vt_objeto("domains", from_domain)
     else:
-        from_intel = {"error": "Dominio From no válido/no disponible"}
+        from_intel = {"error": "dominio From no disponible"}
     from_stats = from_intel.get("last_analysis_stats", {}) if validar_informe_vt(from_intel) else {}
     from_malicious = from_stats.get("malicious", 0) if isinstance(from_stats.get("malicious", 0), int) else 0
     from_suspicious = from_stats.get("suspicious", 0) if isinstance(from_stats.get("suspicious", 0), int) else 0
-    if "error" not in from_intel:
-        print(f"VirusTotal dominio From {from_domain}: {from_malicious} maliciosos; {from_suspicious} sospechosos; reputación={from_intel.get('reputation', 'desconocida')} (fuente: VirusTotal)")
-    else:
-        print(f"VirusTotal dominio From: reputación no disponible ({from_intel['error']})")
     if not validar_informe_vt(from_intel):
         service_issues.extend(_service_issues(from_intel))
 
-    for url in primary_urls:
-        if not url_contiene_secretos(url):
-            service_issues.extend(_url_relationships(url))
-
-    for hop in hops[:20]:
-        for candidate in hop["ips"]:
+    domain_reports = {from_domain: from_intel} if from_domain else {}
+    url_evidences = []
+    previous_domain_reports = _EML_DOMAIN_REPORTS
+    _EML_DOMAIN_REPORTS = domain_reports
+    try:
+        for url in urls_limpias[:MAX_URLS]:
             try:
-                address = ipaddress.ip_address(candidate)
-                if address.is_global:
-                    report = consultar_vt_objeto("ip_addresses", str(address))
-                    service_issues.extend(_service_issues(report))
-                    stats = report.get("last_analysis_stats", {})
-                    state = "desconocido (cuota agotada)" if "error" in report and "cuota" in report["error"] else f"{stats.get('malicious', 'desconocido')} maliciosos; {stats.get('suspicious', 'desconocido')} sospechosos"
-                    print(f"VirusTotal IP candidata {address}: {state} (fuente: VirusTotal; IP no verificada como origen)")
-            except ValueError:
-                continue
+                delegated = analizar_url(url)
+            except (ValueError, TypeError, UnicodeError):
+                local_gaps.append("URL extraída no válida para el flujo URL")
+                delegated = {
+                    "resource_type": "url", "criteria": {
+                        "domain": criterio("unknown", "URL no válida"),
+                        "detections": criterio("unknown", "URL no válida"),
+                        "behavior": criterio("unknown", "URL no válida"),
+                    }, "optional_criteria": {}, "resources": [], "service_issues": [],
+                    "concrete_causes": [], "report": {"virustotal": {"url": "unknown"}},
+                }
+            if isinstance(delegated, dict):
+                url_evidences.append((url, delegated))
+                service_issues.extend(_service_issues(delegated))
+    finally:
+        _EML_DOMAIN_REPORTS = previous_domain_reports
+    if len(urls_limpias) > MAX_URLS:
+        local_gaps.append("URLs omitidas por límite de análisis")
 
-    domain_evidence = analizar_inteligencia_dominio(urls_limpias)
-    domain_evidence = domain_evidence if isinstance(domain_evidence, dict) else {}
-    service_issues.extend(_service_issues(domain_evidence))
-
-    attachment_causes = []
-    attachment_resources, attachment_detection_checks, attachment_behavior_checks = [], [], []
-    for attachment in attachments[:MAX_URLS]:
-        if "sha256" not in attachment:
-            continue
-        report = primary_hash_reports[attachment["sha256"]]
-        service_issues.extend(_service_issues(report))
-        attachment_detection_checks.append(criterio_detecciones(report))
-        attachment_behavior_checks.append(evaluar_comportamiento_archivo(attachment["type"], attachment["script_status"], attachment["macros"], attachment["size"]))
-        if validar_informe_vt(report):
-            stats = report["last_analysis_stats"]
-            malicious, suspicious = stats["malicious"], stats["suspicious"]
-            attachment_resources.append({"resource_type": "file", "report_available": True,
-                                         "malicious": malicious, "suspicious": suspicious,
-                                         "executable": attachment["type"] in ("PE", "ELF", "Mach-O", "script")})
-            print(f"VirusTotal adjunto {attachment['name']}: {malicious} maliciosos; {suspicious} sospechosos (fuente: VirusTotal)")
-            print_metadatos_vt_archivo(report)
-            if malicious or suspicious:
-                attachment_causes.append(f"Adjunto {attachment['name']} SHA-256 {attachment['sha256']}: {malicious} motores maliciosos y {suspicious} sospechosos")
-        else:
-            print(f"VirusTotal adjunto {attachment['name']}: informe desconocido/no disponible")
-
-    if alertas_auth:
-        print("\nProblemas de autenticación reportados:")
-        for alerta in alertas_auth:
-            print(f" - {alerta}")
-
-    available_reports = [estado for _, estado, _, _ in resultados_vt if estado != "desconocido"]
+    url_resources, url_detection_checks, url_behavior_checks, url_reputation_checks = [], [], [], []
     url_causes = []
-    for url, state, malicious, suspicious in resultados_vt:
-        if state in ("malicioso", "sospechoso"):
-            parsed_url = urlparse(url)
-            safe_url = f"{parsed_url.scheme}://{parsed_url.hostname or 'dominio-no-disponible'}{parsed_url.path or '/'}"
-            count_text = f"{malicious} motores maliciosos y {suspicious} sospechosos" if malicious or suspicious else f"URL clasificada como {state} por el proveedor; motores no verificables"
-            url_causes.append(f"URL {safe_url}: {count_text}")
-    from_causes = []
-    if from_malicious or from_suspicious:
-        from_causes.append(f"Dominio From {from_domain}: VirusTotal reportó {from_malicious} motores maliciosos y {from_suspicious} sospechosos; reputación={from_intel.get('reputation', 'desconocida')} (fuente: VirusTotal; no autentica por sí solo al remitente)")
-    concrete_causes = url_causes + from_causes + mismatch_evidence + alertas_auth + attachment_causes + domain_evidence.get("concrete_causes", []) + scan_causes
-    if concrete_causes:
-        print("\nEvidencia concreta para el veredicto:")
-        for cause in concrete_causes[:12]:
-            print(f" - {cause[:300]}")
+    for url, delegated in url_evidences:
+        criteria = delegated.get("criteria", {})
+        optional = delegated.get("optional_criteria", {})
+        url_detection_checks.append(criteria.get("detections", criterio("unknown", "URL")))
+        url_behavior_checks.append(optional.get("remote_behavior", criterio("unknown", "URLscan")))
+        url_reputation_checks.append(optional.get("community_reputation", criterio("unknown", "VT")))
+        service_issues.extend(delegated.get("service_issues", []))
+        url_causes.extend(delegated.get("concrete_causes", []))
+        url_resources.append({
+            "source": url,
+            "report_available": bool(delegated.get("report_available")),
+            "malicious": delegated.get("malicious", 0),
+            "suspicious": delegated.get("suspicious", 0),
+            "confirmed_phishing": delegated.get("confirmed_phishing", False),
+            "high_phishing_risk": delegated.get("high_phishing_risk", False),
+        })
+
+    attachment_resources, attachment_detection_checks, attachment_reputation_checks = [], [], []
+    attachment_behavior_checks, attachment_causes = [], []
+    for attachment in attachments:
+        evidence = attachment.get("evidence")
+        if not isinstance(evidence, dict):
+            continue
+        service_issues.extend(evidence.get("service_issues", []))
+        attachment_detection_checks.append(evidence["criteria"]["detections"])
+        attachment_reputation_checks.append(evidence["optional_criteria"]["community_reputation"])
+        attachment_behavior_checks.append(evidence["criteria"]["behavior"])
+        attachment_causes.extend(evidence.get("concrete_causes", []))
+        attachment_resources.append({
+            "source": f"archivo:{attachment['name']}",
+            "report_available": bool(evidence.get("report_available")),
+            "malicious": evidence.get("malicious", 0),
+            "suspicious": evidence.get("suspicious", 0),
+            "executable": evidence.get("executable", False),
+        })
+
     verified_dkim_aligned = any(signature.get("status") == "verified" and _alineado(signature.get("domain"), from_domain, False) is True for signature in dkim_results)
     auth_pass = bool(smtp_context_available and spf_result[0] == "pass" and spf_alignment is True and verified_dkim_aligned and dmarc_result[0] == "pass")
-    auth_bad = effective_spf in ("fail", "softfail", "permerror") or (smtp_context_available and spf_alignment is False) or dmarc_result[0] in ("fail", "permerror") or any(signature.get("status") == "failed" for signature in dkim_results)
+    auth_bad = effective_spf in ("fail", "softfail", "permerror") or (smtp_context_available and from_domain and spf_domain and spf_alignment is False) or dmarc_result[0] in ("fail", "permerror") or any(signature.get("status") == "failed" for signature in dkim_results)
     auth_failed_checks = []
     if smtp_context_available and effective_spf in ("fail", "softfail", "permerror"):
         auth_failed_checks.append("SPF")
@@ -1949,33 +1967,78 @@ def analizar_eml(ruta, smtp_ip=None, mail_from=None, helo=None, trusted_receiver
         auth_failed_checks.append("DKIM")
     if dmarc_result[0] in ("fail", "permerror"):
         auth_failed_checks.append("DMARC")
-    auth_check = criterio("pass" if auth_pass else "fail" if auth_bad else "unknown", f"SPF={spf_result[0]} (tupla SMTP completa={smtp_context_available}) alineado={spf_alignment}; DKIM verificado y alineado={verified_dkim_aligned}; DMARC={dmarc_result[0]}; valores SMTP extraídos/override del EML, no autenticación histórica del transporte; cabeceras Authentication-Results no usadas como prueba; SPF: {spf_result[1]}; DMARC: {dmarc_result[1]}; DKIM: {', '.join(signature.get('reason', signature['status']) for signature in dkim_results)}")
-    registry = consultar_whois(from_domain) if from_domain else {"error": "From no disponible"}
-    service_issues.extend(_service_issues(registry))
-    domain_check = combinar_criterios([evaluar_dominio(from_domain, from_intel, registry)] + domain_evidence.get("criteria", []), empty="unknown")
+    auth_alerts = ["DMARC" ] if dmarc_result[0] == "fail" else []
+    auth_check = criterio(
+        "pass" if auth_pass else "fail" if auth_bad else "unknown",
+        f"SPF={spf_result[0]}; SPF_alineado={spf_alignment}; DKIM_alineado={verified_dkim_aligned}; DMARC={dmarc_result[0]}",
+    )
+
+    from_domain_check = evaluar_dominio(from_domain, from_intel, {"registration_date": None})
+    url_domain_checks = [item.get("criteria", {}).get("domain") for _, item in url_evidences]
+    domain_check = combinar_criterios([from_domain_check] + [item for item in url_domain_checks if isinstance(item, dict)], empty="unknown")
     detection_check = combinar_criterios([criterio_detecciones(from_intel)] + url_detection_checks + attachment_detection_checks, empty="unknown")
-    behavior_checks = url_behavior_checks + attachment_behavior_checks
-    if body_active or unresolved_encoded or body_credentials:
-        behavior_checks.append(criterio("fail" if body_active or body_credentials else "unknown", "scripts/campo de credenciales en cuerpo o contenido codificado no resuelto; formulario por sí solo no confirma phishing ni infección"))
-    if len(urls_limpias) > MAX_URLS or len(attachments) > MAX_URLS or any("sha256" not in item for item in attachments):
-        behavior_checks.append(criterio("unknown", "recursos omitidos/no decodificables por límites de análisis"))
-    behavior_check = combinar_criterios(behavior_checks, empty="pass")
-    if not behavior_checks:
-        behavior_check = criterio("pass", "cuerpo inspeccionado sin enlaces, adjuntos, scripts ni contenido codificado no resuelto; análisis estático, no ejecución")
+    if len(attachments) > MAX_EML_ATTACHMENTS or any("evidence" not in item for item in attachments):
+        local_gaps.append("adjuntos omitidos o no decodificables")
+        detection_check = combinar_criterios([detection_check, criterio("unknown", "recursos omitidos")])
+    local_inspection = criterio("unknown" if local_gaps else "pass", f"partes={inspected_body_parts}; gaps={'; '.join(dict.fromkeys(local_gaps)) if local_gaps else 'ninguno'}")
+    behavior_check = combinar_criterios([local_inspection] + attachment_behavior_checks)
+
+    concrete_causes = mismatch_evidence + url_causes + attachment_causes
+    if from_malicious or from_suspicious:
+        concrete_causes.append(f"Dominio From {from_domain}: VT maliciosos={from_malicious}; sospechosos={from_suspicious}")
+    if auth_alerts:
+        concrete_causes.append("DMARC: fallo verificado")
+    url_reports = []
+    urlscan_reports, delegated_whois, delegated_crt = [], [], []
+    for url, delegated in url_evidences:
+        delegated_report = delegated.get("report", {})
+        url_reports.append({"url": _redact_display_url(url), "virustotal": delegated_report.get("virustotal", {})})
+        if delegated_report.get("urlscan"):
+            urlscan_reports.append({"url": _redact_display_url(url), **delegated_report["urlscan"]})
+        delegated_whois.extend(delegated_report.get("whois", []))
+        delegated_crt.extend(delegated_report.get("crt_sh", []))
+    attachment_reports = [item["evidence"].get("report", {}).get("file", {}) for item in attachments if isinstance(item.get("evidence"), dict)]
+    report = {
+        "authentication": {"SPF": spf_result[0], "DKIM": ",".join(dkim_statuses), "DMARC": dmarc_result[0],
+                           "SPF_alignment": spf_alignment, "DKIM_alignment": verified_dkim_aligned},
+        "identities": {"From": identity_domains.get("From", "desconocido"),
+                       "Reply-To": identity_domains.get("Reply-To", "desconocido"),
+                       "Return-Path": identity_domains.get("Return-Path", "desconocido"),
+                       "status": "inconsistent" if mismatch_evidence else "consistent" if identity_domains.get("From") else "incomplete"},
+        "origin": origin,
+        "virustotal": {"from_domain": {"domain": from_domain or "desconocido", "status": criterio_detecciones(from_intel)["status"],
+                                         "malicious": from_malicious, "suspicious": from_suspicious,
+                                         "reputation": from_intel.get("reputation", "desconocida"),
+                                         "requirements": "VT_clean; WHOIS_age>=180d; reputation>0"},
+                       "urls": url_reports, "files": [{"name": item.get("name"), "sha256": item.get("sha256"),
+                                                         "status": item.get("evidence", {}).get("report", {}).get("virustotal", {}).get("report", "unknown")}
+                                                        for item in attachments]},
+        "urlscan": urlscan_reports,
+        "file": attachment_reports,
+    }
+    if delegated_whois:
+        report["whois"] = delegated_whois
+    if delegated_crt:
+        report["crt_sh"] = delegated_crt
     verdict_evidence = {
         "resource_type": "eml",
-        "resources": url_resources + attachment_resources + domain_evidence.get("resources", []) + ([{"source": f"Dominio From {from_domain} (VirusTotal)", "malicious": from_malicious, "suspicious": from_suspicious, "report_available": True}] if validar_informe_vt(from_intel) else []),
-        "high_phishing_risk": bool(scan_causes),
-        "auth_failure": bool(alertas_auth),
+        "resources": url_resources + attachment_resources + ([{"source": f"Dominio From {from_domain}", "malicious": from_malicious,
+                                                               "suspicious": from_suspicious, "report_available": True}] if validar_informe_vt(from_intel) else []),
+        "high_phishing_risk": any(item.get("high_phishing_risk") for item in url_resources),
+        "auth_failure": bool(auth_alerts),
         "auth_failed_checks": auth_failed_checks,
         "mixed": bool(mismatch_evidence or from_malicious or from_suspicious),
-        "report_available": bool(available_reports) or "error" not in from_intel,
+        "report_available": bool(url_resources or attachment_resources) or validar_informe_vt(from_intel),
         "criteria": {"authentication": auth_check, "domain": domain_check, "detections": detection_check, "behavior": behavior_check},
+        "local_inspection": local_inspection,
+        "optional_criteria": {"remote_behavior": combinar_criterios(url_behavior_checks),
+                              "community_reputation": combinar_criterios([_community_reputation_check(from_intel)] + url_reputation_checks + attachment_reputation_checks)},
         "concrete_causes": concrete_causes,
         "service_issues": [{"service": service, "reason": reason} for service, reason in
-                           dict.fromkeys((issue["service"], issue["reason"]) for issue in service_issues)],
+                           dict.fromkeys((issue["service"], issue["reason"]) for issue in service_issues if isinstance(issue, dict) and issue.get("service") and issue.get("reason"))],
+        "report": report,
     }
-    return imprimir_veredicto(verdict_evidence)
+    return imprimir_veredicto(verdict_evidence) if emitir else verdict_evidence
 
 
 def analizar_recurso(recurso):
